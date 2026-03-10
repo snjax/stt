@@ -1,0 +1,11 @@
+torch==2.8.0
+torchaudio==2.8.0
+transformers==4.57.1
+sentencepiece
+onnx
+onnxruntime
+hydra-core
+omegaconf
+numba
+pyannote.audio==4.0.0
+torchcodec==0.7.0

@@ -1,0 +1,10 @@
+/target/
+/models/
+/test_data/
+/.venv/
+__pycache__/
+*.pyc
+*.onnx
+*.onnx.data
+*.wav
+.DS_Store
