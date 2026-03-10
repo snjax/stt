@@ -16,15 +16,6 @@ cpal = "0.16"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
 hound = "3.5"
-rustfft = "6.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sentencepiece = "0.13"
-
-[dependencies.ort]
-version = "=2.0.0-rc.10"
-default-features = false
-features = ["std", "ndarray", "load-dynamic"]
 
 [build-dependencies]
 cmake = "0.1"

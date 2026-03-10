@@ -4,9 +4,6 @@
 /.venv/
 __pycache__/
 *.pyc
-*.onnx
-*.onnx.data
 *.wav
-.DS_Store
 *.bin
-PRD.md
+.DS_Store

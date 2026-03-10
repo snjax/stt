@@ -10,7 +10,7 @@ const WINDOW_SECONDS: usize = 10;
 /// Maximum window size (Whisper trained on 30s chunks)
 const MAX_WINDOW_SECONDS: usize = 30;
 /// Minimum interval between streaming inference calls
-const MIN_CHUNK_INTERVAL: Duration = Duration::from_millis(500);
+const MIN_CHUNK_INTERVAL: Duration = Duration::from_secs(5);
 /// Minimum audio length to trigger inference (1 second)
 const MIN_AUDIO_SAMPLES: usize = SAMPLE_RATE;
 
@@ -29,6 +29,11 @@ impl StreamingEngine {
             partial_text: String::new(),
             last_inference: None,
         }
+    }
+
+    /// Append samples to the buffer without running inference.
+    pub fn append_samples(&mut self, new_samples: &[f32]) {
+        self.audio_buffer.extend_from_slice(new_samples);
     }
 
     /// Push new audio samples and optionally get a partial transcription.
@@ -69,7 +74,9 @@ impl StreamingEngine {
 
     /// Finalize: run inference on the full audio buffer for best quality.
     pub fn finalize(&mut self) -> Result<String> {
+        eprintln!("[finalize] audio_buffer len: {} ({:.1}s)", self.audio_buffer.len(), self.audio_buffer.len() as f64 / SAMPLE_RATE as f64);
         if self.audio_buffer.is_empty() {
+            eprintln!("[finalize] buffer empty, returning empty string");
             return Ok(String::new());
         }
 

@@ -1,9 +1,6 @@
 mod app;
 mod audio;
-mod inference;
-mod mel;
 mod streaming;
-mod tokenizer;
 mod whisper_cpp;
 
 use std::{
@@ -15,8 +12,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    app::{BackendChoice, run_gui},
-    inference::{ModelPaths, Transcriber},
+    app::run_gui,
     whisper_cpp::WhisperCppTranscriber,
 };
 
@@ -28,22 +24,20 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let (backend, file_path) = parse_args()?;
+    let file_path = parse_args()?;
 
     match file_path {
-        Some(path) => transcribe_file(backend, &path),
-        None => run_gui(backend),
+        Some(path) => transcribe_file(&path),
+        None => run_gui(),
     }
 }
 
-fn parse_args() -> Result<(BackendChoice, Option<PathBuf>)> {
-    let mut backend = BackendChoice::GigaAm;
+fn parse_args() -> Result<Option<PathBuf>> {
     let mut file_path: Option<PathBuf> = None;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--whisper" => backend = BackendChoice::WhisperCpp,
             "--file" => {
                 let path = args
                     .next()
@@ -62,25 +56,16 @@ fn parse_args() -> Result<(BackendChoice, Option<PathBuf>)> {
         }
     }
 
-    Ok((backend, file_path))
+    Ok(file_path)
 }
 
-fn transcribe_file(backend: BackendChoice, path: &Path) -> Result<()> {
-    let text = match backend {
-        BackendChoice::GigaAm => {
-            let mut transcriber = Transcriber::new(ModelPaths::discover()?)?;
-            transcriber.transcribe_wav_file(path)?
-        }
-        BackendChoice::WhisperCpp => {
-            let transcriber = WhisperCppTranscriber::new()?;
-            transcriber.transcribe_wav_file(path)?
-        }
-    };
-
+fn transcribe_file(path: &Path) -> Result<()> {
+    let transcriber = WhisperCppTranscriber::new()?;
+    let text = transcriber.transcribe_wav_file(path)?;
     println!("{text}");
     Ok(())
 }
 
 fn usage() -> &'static str {
-    "cargo run -- [--whisper] [--file path/to.wav]"
+    "stt [--file path/to.wav]"
 }

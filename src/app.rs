@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::Duration,
@@ -11,39 +10,13 @@ use eframe::egui::{self, Color32, RichText, Stroke, ViewportBuilder};
 
 use crate::{
     audio::AudioRecorder,
-    inference::{ModelPaths, Transcriber},
     streaming::StreamingEngine,
     whisper_cpp::WhisperCppTranscriber,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendChoice {
-    GigaAm,
-    WhisperCpp,
-}
-
-impl BackendChoice {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::GigaAm => "GigaAM-v3",
-            Self::WhisperCpp => "Whisper (whisper.cpp)",
-        }
-    }
-
-    pub fn supports_streaming(self) -> bool {
-        matches!(self, Self::WhisperCpp)
-    }
-}
-
-impl fmt::Display for BackendChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.display_name())
-    }
-}
+const BACKEND_NAME: &str = "Whisper (whisper.cpp)";
 
 enum InferenceCommand {
-    /// GigaAM-style: full audio, transcribe at once
-    Transcribe(Vec<f32>),
     /// Streaming: push new samples for partial result
     PushSamples(Vec<f32>),
     /// Streaming: finalize and get best result
@@ -55,26 +28,7 @@ enum InferenceEvent {
     PartialResult(String),
 }
 
-enum WorkerTranscriber {
-    GigaAm(Transcriber),
-    WhisperStreaming(StreamingEngine),
-}
-
-impl WorkerTranscriber {
-    fn new(backend: BackendChoice) -> Result<Self> {
-        match backend {
-            BackendChoice::GigaAm => {
-                Ok(Self::GigaAm(Transcriber::new(ModelPaths::discover()?)?))
-            }
-            BackendChoice::WhisperCpp => {
-                let transcriber = WhisperCppTranscriber::new()?;
-                Ok(Self::WhisperStreaming(StreamingEngine::new(transcriber)))
-            }
-        }
-    }
-}
-
-pub fn run_gui(backend: BackendChoice) -> Result<()> {
+pub fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Speech To Text")
@@ -87,14 +41,13 @@ pub fn run_gui(backend: BackendChoice) -> Result<()> {
     eframe::run_native(
         "stt",
         options,
-        Box::new(move |cc| Ok(Box::new(SpeechApp::new(cc, backend)))),
+        Box::new(move |cc| Ok(Box::new(SpeechApp::new(cc)))),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(())
 }
 
 pub struct SpeechApp {
-    backend: BackendChoice,
     recorder: AudioRecorder,
     worker_tx: Sender<InferenceCommand>,
     worker_rx: Receiver<InferenceEvent>,
@@ -108,16 +61,15 @@ pub struct SpeechApp {
 }
 
 impl SpeechApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, backend: BackendChoice) -> Self {
-        let (worker_tx, worker_rx) = spawn_inference_worker(backend);
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (worker_tx, worker_rx) = spawn_inference_worker();
         Self {
-            backend,
             recorder: AudioRecorder::default(),
             worker_tx,
             worker_rx,
             transcription: String::new(),
             partial_text: String::new(),
-            status_text: format!("Idle ({backend})"),
+            status_text: format!("Idle ({BACKEND_NAME})"),
             recording: false,
             transcribing: false,
             pinned: true,
@@ -130,7 +82,7 @@ impl SpeechApp {
             Ok(()) => {
                 self.recording = true;
                 self.partial_text.clear();
-                self.status_text = format!("Recording for {}...", self.backend);
+                self.status_text = "Recording...".to_owned();
             }
             Err(error) => {
                 self.status_text = format!("Audio error: {error}");
@@ -139,57 +91,36 @@ impl SpeechApp {
     }
 
     fn stop_recording(&mut self) {
-        if self.backend.supports_streaming() {
-            // For streaming: drain remaining samples, then finalize
-            let remaining = self.recorder.drain_new_samples();
-            if !remaining.is_empty() {
-                let _ = self
-                    .worker_tx
-                    .send(InferenceCommand::PushSamples(remaining));
-            }
-            // Stop the audio stream
-            let _ = self.recorder.stop();
-            self.recording = false;
-            self.transcribing = true;
-            self.status_text = format!("Finalizing with {}...", self.backend);
-            if let Err(error) = self.worker_tx.send(InferenceCommand::Finalize) {
-                self.transcribing = false;
-                self.status_text = format!("Worker error: {error}");
-            }
-        } else {
-            // GigaAM: original behavior - stop and send all samples
-            match self.recorder.stop() {
-                Ok(samples) => {
-                    self.recording = false;
-                    if samples.is_empty() {
-                        self.status_text = "No audio captured.".to_owned();
-                        return;
-                    }
-
-                    self.transcribing = true;
-                    self.status_text = format!(
-                        "Transcribing {:.1}s of audio with {}...",
-                        samples.len() as f32 / 16_000.0,
-                        self.backend
-                    );
-                    if let Err(error) =
-                        self.worker_tx.send(InferenceCommand::Transcribe(samples))
-                    {
-                        self.transcribing = false;
-                        self.status_text = format!("Worker error: {error}");
-                    }
-                }
-                Err(error) => {
-                    self.recording = false;
-                    self.status_text = format!("Stop failed: {error}");
+        // Drain remaining samples
+        let remaining = self.recorder.drain_new_samples();
+        if !remaining.is_empty() {
+            let _ = self
+                .worker_tx
+                .send(InferenceCommand::PushSamples(remaining));
+        }
+        // Stop the audio stream — capture any samples that arrived between drain and stop
+        match self.recorder.stop() {
+            Ok(leftover) => {
+                if !leftover.is_empty() {
+                    let _ = self
+                        .worker_tx
+                        .send(InferenceCommand::PushSamples(leftover));
                 }
             }
+            Err(e) => eprintln!("recorder stop error: {e}"),
+        }
+        self.recording = false;
+        self.transcribing = true;
+        self.status_text = "Finalizing...".to_owned();
+        if let Err(error) = self.worker_tx.send(InferenceCommand::Finalize) {
+            self.transcribing = false;
+            self.status_text = format!("Worker error: {error}");
         }
     }
 
     /// Drain samples from recorder and send to streaming worker
     fn drain_streaming_samples(&mut self) {
-        if !self.recording || !self.backend.supports_streaming() {
+        if !self.recording {
             return;
         }
 
@@ -231,8 +162,7 @@ impl SpeechApp {
                             if self.auto_clipboard {
                                 self.copy_transcription();
                             } else {
-                                self.status_text =
-                                    format!("Transcription complete ({})", self.backend);
+                                self.status_text = "Transcription complete.".to_owned();
                             }
                         }
                         Err(error) => {
@@ -275,7 +205,7 @@ impl SpeechApp {
             painter.text(
                 egui::pos2(center.x + 14.0, rect.center().y - 8.0),
                 egui::Align2::LEFT_TOP,
-                format!("Recording for {}...", self.backend),
+                "Recording...",
                 egui::TextStyle::Body.resolve(ui.style()),
                 Color32::from_rgb(220, 40, 40),
             );
@@ -283,7 +213,7 @@ impl SpeechApp {
             painter.text(
                 rect.left_center() + egui::vec2(0.0, -8.0),
                 egui::Align2::LEFT_TOP,
-                format!("Running {}...", self.backend),
+                "Transcribing...",
                 egui::TextStyle::Body.resolve(ui.style()),
                 Color32::from_rgb(240, 180, 60),
             );
@@ -291,7 +221,7 @@ impl SpeechApp {
             painter.text(
                 rect.left_center() + egui::vec2(0.0, -8.0),
                 egui::Align2::LEFT_TOP,
-                format!("Ready ({})", self.backend),
+                format!("Ready ({BACKEND_NAME})"),
                 egui::TextStyle::Body.resolve(ui.style()),
                 Color32::GRAY,
             );
@@ -303,13 +233,12 @@ impl eframe::App for SpeechApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
 
-        // Drain audio samples for streaming backends
-        if self.recording && self.backend.supports_streaming() {
+        // Drain audio samples for streaming
+        if self.recording {
             self.drain_streaming_samples();
         }
 
         if self.recording || self.transcribing {
-            // Repaint at ~30fps during recording (for streaming updates + animation)
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -370,7 +299,6 @@ impl eframe::App for SpeechApp {
             });
 
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("Backend: {}", self.backend)).small());
             self.recording_indicator(ui);
             ui.label(RichText::new(&self.status_text).small());
             ui.add_space(4.0);
@@ -397,20 +325,18 @@ impl eframe::App for SpeechApp {
     }
 }
 
-fn spawn_inference_worker(
-    backend: BackendChoice,
-) -> (Sender<InferenceCommand>, Receiver<InferenceEvent>) {
+fn spawn_inference_worker() -> (Sender<InferenceCommand>, Receiver<InferenceEvent>) {
     let (command_tx, command_rx) = mpsc::channel::<InferenceCommand>();
     let (event_tx, event_rx) = mpsc::channel::<InferenceEvent>();
 
     thread::spawn(move || {
-        let mut transcriber: Option<WorkerTranscriber> = None;
+        let mut engine: Option<StreamingEngine> = None;
 
         while let Ok(command) = command_rx.recv() {
-            // Lazily initialize transcriber
-            if transcriber.is_none() {
-                match WorkerTranscriber::new(backend) {
-                    Ok(t) => transcriber = Some(t),
+            // Lazily initialize
+            if engine.is_none() {
+                match WhisperCppTranscriber::new() {
+                    Ok(t) => engine = Some(StreamingEngine::new(t)),
                     Err(e) => {
                         let _ = event_tx.send(InferenceEvent::Finished(Err(e.to_string())));
                         continue;
@@ -418,27 +344,11 @@ fn spawn_inference_worker(
                 }
             }
 
-            let worker = transcriber.as_mut().unwrap();
+            let engine = engine.as_mut().unwrap();
 
             match command {
-                InferenceCommand::Transcribe(samples) => {
-                    let result = match worker {
-                        WorkerTranscriber::GigaAm(t) => {
-                            t.transcribe_samples(&samples).map_err(|e| e.to_string())
-                        }
-                        WorkerTranscriber::WhisperStreaming(engine) => {
-                            // Non-streaming fallback: push all then finalize
-                            engine.push_samples(&samples);
-                            engine.finalize().map_err(|e| e.to_string())
-                        }
-                    };
-                    if event_tx.send(InferenceEvent::Finished(result)).is_err() {
-                        break;
-                    }
-                }
                 InferenceCommand::PushSamples(samples) => {
-                    if let WorkerTranscriber::WhisperStreaming(engine) = worker
-                        && let Some(text) = engine.push_samples(&samples)
+                    if let Some(text) = engine.push_samples(&samples)
                         && event_tx
                             .send(InferenceEvent::PartialResult(text))
                             .is_err()
@@ -447,12 +357,13 @@ fn spawn_inference_worker(
                     }
                 }
                 InferenceCommand::Finalize => {
-                    let result = match worker {
-                        WorkerTranscriber::WhisperStreaming(engine) => {
-                            engine.finalize().map_err(|e| e.to_string())
+                    // Drain all pending PushSamples without running inference
+                    while let Ok(cmd) = command_rx.try_recv() {
+                        if let InferenceCommand::PushSamples(samples) = cmd {
+                            engine.append_samples(&samples);
                         }
-                        WorkerTranscriber::GigaAm(_) => Ok(String::new()),
-                    };
+                    }
+                    let result = engine.finalize().map_err(|e| e.to_string());
                     if event_tx.send(InferenceEvent::Finished(result)).is_err() {
                         break;
                     }

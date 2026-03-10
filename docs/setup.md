@@ -2,82 +2,56 @@
 
 ## macOS (Apple Silicon)
 
-### 1. Install ONNX Runtime
+### 1. Build
 
 ```bash
-brew install onnxruntime
-```
-
-This installs `libonnxruntime.dylib` to `/opt/homebrew/lib/`, which the app
-discovers automatically. Override with `ORT_DYLIB_PATH` if needed.
-
-### 2. Export GigaAM Models
-
-```bash
-# Create a Python venv for export scripts
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r scripts/requirements.txt
-
-# Export ONNX models
-python3 scripts/export_onnx.py
-```
-
-Models are saved to `models/onnx/` (~950 MB total).
-
-### 3. (Optional) Whisper Backend
-
-```bash
-# In the same venv or a new one:
-pip install mlx-whisper
-```
-
-The model weights (~3 GB) are downloaded automatically on first use.
-
-### 4. Build and Run
-
-```bash
+git submodule update --init --recursive
 cargo build --release
-./target/release/stt              # GigaAM GUI
-./target/release/stt --whisper    # Whisper GUI
 ```
 
-## macOS (Intel)
+CMake and a C++ compiler are required (Xcode Command Line Tools).
+whisper.cpp is built automatically via `build.rs` with Metal GPU support.
 
-Same as Apple Silicon, but:
-- ORT path: `/usr/local/lib/libonnxruntime.dylib`
-- MLX (Whisper) is not supported on Intel Macs — use GigaAM only
+### 2. Model
+
+Place a GGML model in `models/`:
+
+```bash
+mkdir -p models
+curl -L -o models/ggml-large-v3-turbo.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+```
+
+Or set `STT_WHISPER_MODEL=/path/to/model.bin`.
+
+### 3. Run
+
+```bash
+./target/release/stt              # GUI
+./target/release/stt --file a.wav # File mode
+```
 
 ## Linux
 
-### 1. Install ONNX Runtime
-
-Download from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
-and place `libonnxruntime.so` in `/usr/lib/` or set `ORT_DYLIB_PATH`.
-
-For CUDA support, use the GPU variant (`onnxruntime-gpu`).
-
-### 2. Audio Dependencies
+### 1. Audio Dependencies
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libasound2-dev
+sudo apt install libasound2-dev cmake
 
 # Fedora
-sudo dnf install alsa-lib-devel
+sudo dnf install alsa-lib-devel cmake
 ```
 
-### 3. Export and Build
-
-Same as macOS:
+### 2. Build and Run
 
 ```bash
-python3 scripts/export_onnx.py
+git submodule update --init --recursive
 cargo build --release
 ./target/release/stt
 ```
 
-Note: Whisper MLX backend is macOS-only. On Linux, use GigaAM.
+For CUDA GPU acceleration, build with `cargo build --release --features cuda`.
 
 ## Download Test Audio
 
@@ -87,31 +61,15 @@ python3 scripts/download_test_audio.py
 
 Downloads `test_ru.wav` and `test_en.wav` to `test_data/`.
 
-## Verify Inference
-
-```bash
-python3 scripts/test_inference.py
-```
-
-Compares PyTorch and ONNX inference results on test audio files.
-
 ## Troubleshooting
 
-### "mlx_whisper import failed: No module named 'mlx_whisper'"
+### "unable to find whisper GGML model"
 
-The app couldn't find a Python with mlx-whisper installed. Solutions:
-1. Create `.venv` in the project root: `python3 -m venv .venv && .venv/bin/pip install mlx-whisper`
-2. Or set `PYTHON=/path/to/python-with-mlx-whisper`
+Download the model or set `STT_WHISPER_MODEL=/path/to/model.bin`.
 
-### "unable to find libonnxruntime"
+### Build fails with CMake errors
 
-Set `ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib` (or `.so` on Linux).
-
-### "unable to find models"
-
-Set `STT_MODEL_DIR=/path/to/models/onnx` or run from the project root.
-
-### "Protobuf parsing failed"
-
-Ensure `ort` crate is pinned to `=2.0.0-rc.10` in Cargo.toml. Later versions
-have a broken static library.
+Ensure CMake is installed and whisper.cpp submodule is initialized:
+```bash
+git submodule update --init --recursive
+```
