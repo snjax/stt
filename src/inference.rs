@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use ort::{
-    execution_providers::CoreMLExecutionProvider,
     session::Session,
     value::TensorRef,
 };

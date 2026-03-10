@@ -2,8 +2,9 @@ mod app;
 mod audio;
 mod inference;
 mod mel;
+mod streaming;
 mod tokenizer;
-mod whisper;
+mod whisper_cpp;
 
 use std::{
     env,
@@ -16,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     app::{BackendChoice, run_gui},
     inference::{ModelPaths, Transcriber},
-    whisper::WhisperTranscriber,
+    whisper_cpp::WhisperCppTranscriber,
 };
 
 fn main() {
@@ -42,7 +43,7 @@ fn parse_args() -> Result<(BackendChoice, Option<PathBuf>)> {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--whisper" => backend = BackendChoice::Whisper,
+            "--whisper" => backend = BackendChoice::WhisperCpp,
             "--file" => {
                 let path = args
                     .next()
@@ -70,8 +71,8 @@ fn transcribe_file(backend: BackendChoice, path: &Path) -> Result<()> {
             let mut transcriber = Transcriber::new(ModelPaths::discover()?)?;
             transcriber.transcribe_wav_file(path)?
         }
-        BackendChoice::Whisper => {
-            let mut transcriber = WhisperTranscriber::new()?;
+        BackendChoice::WhisperCpp => {
+            let transcriber = WhisperCppTranscriber::new()?;
             transcriber.transcribe_wav_file(path)?
         }
     };

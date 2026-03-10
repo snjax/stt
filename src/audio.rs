@@ -78,6 +78,27 @@ impl AudioRecorder {
         Ok(())
     }
 
+    /// Drain new samples from the buffer without stopping the recording.
+    /// Returns resampled samples at 16kHz if needed.
+    pub fn drain_new_samples(&self) -> Vec<f32> {
+        let captured = {
+            let Ok(mut buffer) = self.buffer.lock() else {
+                return Vec::new();
+            };
+            buffer.drain(..).collect::<Vec<_>>()
+        };
+
+        if captured.is_empty() {
+            return captured;
+        }
+
+        if self.input_sample_rate == TARGET_SAMPLE_RATE {
+            captured
+        } else {
+            resample_linear(&captured, self.input_sample_rate, TARGET_SAMPLE_RATE)
+        }
+    }
+
     pub fn stop(&mut self) -> Result<Vec<f32>> {
         if self.stream.take().is_none() {
             bail!("recording is not active");

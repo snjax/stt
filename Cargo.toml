@@ -1,7 +1,13 @@
 [package]
 name = "stt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+build = "build.rs"
+
+[features]
+default = []
+cuda = []
+metal = []
 
 [dependencies]
 anyhow = "1.0"
@@ -19,3 +25,6 @@ sentencepiece = "0.13"
 version = "=2.0.0-rc.10"
 default-features = false
 features = ["std", "ndarray", "load-dynamic"]
+
+[build-dependencies]
+cmake = "0.1"

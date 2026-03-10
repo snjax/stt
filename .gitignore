@@ -8,3 +8,5 @@ __pycache__/
 *.onnx.data
 *.wav
 .DS_Store
+*.bin
+PRD.md
