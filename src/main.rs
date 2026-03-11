@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod paste;
 mod streaming;
 mod whisper_cpp;
 

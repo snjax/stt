@@ -182,6 +182,21 @@ unsafe extern "C" {
     ) -> i32;
     fn whisper_full_n_segments(ctx: *mut whisper_context) -> i32;
     fn whisper_full_get_segment_text(ctx: *mut whisper_context, i_segment: i32) -> *const i8;
+
+    fn whisper_pcm_to_mel(
+        ctx: *mut whisper_context,
+        samples: *const f32,
+        n_samples: i32,
+        n_threads: i32,
+    ) -> i32;
+    fn whisper_lang_auto_detect(
+        ctx: *mut whisper_context,
+        offset_ms: i32,
+        n_threads: i32,
+        lang_probs: *mut f32,
+    ) -> i32;
+    fn whisper_lang_max_id() -> i32;
+    fn whisper_lang_str(id: i32) -> *const i8;
 }
 
 // --- Safe Rust wrapper ---
@@ -233,6 +248,13 @@ impl WhisperCppTranscriber {
         params.print_timestamps = false;
         params.n_threads = num_cpus().min(8) as i32;
 
+        // Two-pass: detect language first, restrict to ru/en
+        let detected = self.detect_language(samples)?;
+        let forced_lang = if detected == "ru" { "ru" } else { "en" };
+        let forced = CString::new(forced_lang).unwrap();
+        params.language = forced.as_ptr();
+        params.detect_language = false;
+
         let ret = unsafe {
             whisper_full(self.ctx, params, samples.as_ptr(), samples.len() as i32)
         };
@@ -282,6 +304,13 @@ impl WhisperCppTranscriber {
         params.print_timestamps = false;
         params.n_threads = num_cpus().min(8) as i32;
 
+        // Two-pass: detect language first, restrict to ru/en
+        let detected = self.detect_language(samples)?;
+        let forced_lang = if detected == "ru" { "ru" } else { "en" };
+        let forced = CString::new(forced_lang).unwrap();
+        params.language = forced.as_ptr();
+        params.detect_language = false;
+
         let ret = unsafe {
             whisper_full(self.ctx, params, samples.as_ptr(), samples.len() as i32)
         };
@@ -306,6 +335,56 @@ impl WhisperCppTranscriber {
         }
 
         Ok(text.trim().to_owned())
+    }
+
+    /// Detect language from audio samples, restricted to Russian and English.
+    /// Returns "ru" or "en".
+    fn detect_language(&self, samples: &[f32]) -> Result<String> {
+        // Use at most first 30s for detection (whisper limit)
+        let max_samples = 16_000 * 30;
+        let detect_samples = if samples.len() > max_samples {
+            &samples[..max_samples]
+        } else {
+            samples
+        };
+
+        let n_threads = num_cpus().min(8) as i32;
+
+        let ret = unsafe {
+            whisper_pcm_to_mel(
+                self.ctx,
+                detect_samples.as_ptr(),
+                detect_samples.len() as i32,
+                n_threads,
+            )
+        };
+        if ret != 0 {
+            bail!("whisper_pcm_to_mel failed with code {ret}");
+        }
+
+        let max_id = unsafe { whisper_lang_max_id() };
+        let mut lang_probs = vec![0.0f32; (max_id + 1) as usize];
+
+        let detected_id = unsafe {
+            whisper_lang_auto_detect(self.ctx, 0, n_threads, lang_probs.as_mut_ptr())
+        };
+
+        if detected_id < 0 {
+            bail!("whisper_lang_auto_detect failed with code {detected_id}");
+        }
+
+        let detected = unsafe {
+            let ptr = whisper_lang_str(detected_id);
+            if ptr.is_null() {
+                "en"
+            } else {
+                CStr::from_ptr(ptr).to_str().unwrap_or("en")
+            }
+        };
+
+        let lang = if detected == "ru" { "ru" } else { "en" };
+        eprintln!("Language detected: {detected} → using: {lang}");
+        Ok(lang.to_owned())
     }
 
     pub fn transcribe_wav_file(&self, path: &Path) -> Result<String> {

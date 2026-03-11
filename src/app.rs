@@ -1,26 +1,172 @@
 use std::{
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use arboard::Clipboard;
-use eframe::egui::{self, Color32, RichText, Stroke, ViewportBuilder};
+use eframe::egui::{self, RichText, ViewportBuilder, ViewportClass, ViewportId};
+use global_hotkey::{
+    GlobalHotKeyEvent, GlobalHotKeyManager,
+    hotkey::{Code, HotKey, Modifiers},
+};
 
 use crate::{
     audio::AudioRecorder,
+    paste::{get_active_window, simulate_paste},
     streaming::StreamingEngine,
     whisper_cpp::WhisperCppTranscriber,
 };
 
-const BACKEND_NAME: &str = "Whisper (whisper.cpp)";
+// ── AutoAction ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AutoAction {
+    None,
+    Copy,
+    Paste,
+}
+
+impl AutoAction {
+    const ALL: [AutoAction; 3] = [AutoAction::None, AutoAction::Copy, AutoAction::Paste];
+
+    fn label(self) -> &'static str {
+        match self {
+            AutoAction::None => "Nothing",
+            AutoAction::Copy => "Copy to clipboard",
+            AutoAction::Paste => "Paste to active window",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            AutoAction::None => "Do nothing after transcription completes.",
+            AutoAction::Copy => "Automatically copy the transcribed text to the system clipboard.",
+            AutoAction::Paste => {
+                "Copy text and simulate Ctrl+V / Cmd+V into the window that was \
+                 active when recording started. The previous clipboard contents \
+                 are restored afterward. Falls back to copy if the target window \
+                 has changed or cannot be detected."
+            }
+        }
+    }
+}
+
+// ── Hotkey config ───────────────────────────────────────────────────
+
+const KEY_OPTIONS: &[(&str, Code)] = &[
+    ("A", Code::KeyA),
+    ("B", Code::KeyB),
+    ("C", Code::KeyC),
+    ("D", Code::KeyD),
+    ("E", Code::KeyE),
+    ("F", Code::KeyF),
+    ("G", Code::KeyG),
+    ("H", Code::KeyH),
+    ("I", Code::KeyI),
+    ("J", Code::KeyJ),
+    ("K", Code::KeyK),
+    ("L", Code::KeyL),
+    ("M", Code::KeyM),
+    ("N", Code::KeyN),
+    ("O", Code::KeyO),
+    ("P", Code::KeyP),
+    ("Q", Code::KeyQ),
+    ("R", Code::KeyR),
+    ("S", Code::KeyS),
+    ("T", Code::KeyT),
+    ("U", Code::KeyU),
+    ("V", Code::KeyV),
+    ("W", Code::KeyW),
+    ("X", Code::KeyX),
+    ("Y", Code::KeyY),
+    ("Z", Code::KeyZ),
+    ("F1", Code::F1),
+    ("F2", Code::F2),
+    ("F3", Code::F3),
+    ("F4", Code::F4),
+    ("F5", Code::F5),
+    ("F6", Code::F6),
+    ("F7", Code::F7),
+    ("F8", Code::F8),
+    ("F9", Code::F9),
+    ("F10", Code::F10),
+    ("F11", Code::F11),
+    ("F12", Code::F12),
+];
+
+#[derive(Clone)]
+struct HotkeyConfig {
+    use_super: bool,
+    use_ctrl: bool,
+    use_shift: bool,
+    use_alt: bool,
+    key_idx: usize,
+}
+
+impl HotkeyConfig {
+    fn default_config() -> Self {
+        Self {
+            use_super: true,
+            use_ctrl: false,
+            use_shift: true,
+            use_alt: false,
+            key_idx: 17, // R
+        }
+    }
+
+    fn to_hotkey(&self) -> HotKey {
+        let mut mods = Modifiers::empty();
+        if self.use_super {
+            mods |= Modifiers::SUPER;
+        }
+        if self.use_ctrl {
+            mods |= Modifiers::CONTROL;
+        }
+        if self.use_shift {
+            mods |= Modifiers::SHIFT;
+        }
+        if self.use_alt {
+            mods |= Modifiers::ALT;
+        }
+        let modifiers = if mods.is_empty() { None } else { Some(mods) };
+        HotKey::new(modifiers, KEY_OPTIONS[self.key_idx].1)
+    }
+
+    fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.use_super {
+            parts.push(if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Super"
+            });
+        }
+        if self.use_ctrl {
+            parts.push("Ctrl");
+        }
+        if self.use_alt {
+            parts.push(if cfg!(target_os = "macos") {
+                "Option"
+            } else {
+                "Alt"
+            });
+        }
+        if self.use_shift {
+            parts.push("Shift");
+        }
+        parts.push(KEY_OPTIONS[self.key_idx].0);
+        parts.join("+")
+    }
+}
+
+// ── Worker protocol ─────────────────────────────────────────────────
 
 enum InferenceCommand {
-    /// Streaming: push new samples for partial result
     PushSamples(Vec<f32>),
-    /// Streaming: finalize and get best result
     Finalize,
+    Shutdown,
 }
 
 enum InferenceEvent {
@@ -28,12 +174,23 @@ enum InferenceEvent {
     PartialResult(String),
 }
 
+// ── Entry point ─────────────────────────────────────────────────────
+
 pub fn run_gui() -> Result<()> {
+    let hotkey_manager = GlobalHotKeyManager::new()
+        .map_err(|e| anyhow::anyhow!("failed to create hotkey manager: {e}"))?;
+
+    let config = HotkeyConfig::default_config();
+    let hotkey = config.to_hotkey();
+    hotkey_manager
+        .register(hotkey)
+        .map_err(|e| anyhow::anyhow!("failed to register hotkey: {e}"))?;
+
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_title("Speech To Text")
-            .with_inner_size([400.0, 300.0])
-            .with_min_inner_size([360.0, 240.0])
+            .with_title("STT — Ready")
+            .with_inner_size([200.0, 160.0])
+            .with_min_inner_size([140.0, 100.0])
             .with_always_on_top(),
         ..Default::default()
     };
@@ -41,64 +198,101 @@ pub fn run_gui() -> Result<()> {
     eframe::run_native(
         "stt",
         options,
-        Box::new(move |cc| Ok(Box::new(SpeechApp::new(cc)))),
+        Box::new(move |cc| {
+            Ok(Box::new(SpeechApp::new(cc, hotkey, config, hotkey_manager)))
+        }),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(())
 }
 
+// ── App state ───────────────────────────────────────────────────────
+
 pub struct SpeechApp {
     recorder: AudioRecorder,
     worker_tx: Sender<InferenceCommand>,
     worker_rx: Receiver<InferenceEvent>,
+    worker_handle: Option<thread::JoinHandle<()>>,
     transcription: String,
     partial_text: String,
-    status_text: String,
     recording: bool,
     transcribing: bool,
+
+    // Settings
     pinned: bool,
-    auto_clipboard: bool,
+    auto_action: AutoAction,
+    hotkey_config: HotkeyConfig,
+    pending_hotkey: HotkeyConfig,
+
+    // Hotkey management
+    current_hotkey: HotKey,
+    hotkey_manager: GlobalHotKeyManager,
+
+    // Paste target tracking
+    paste_target_window: Option<String>,
+    title_warning: Option<(String, Instant)>,
+
+    // UI
+    show_settings: bool,
 }
 
 impl SpeechApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let (worker_tx, worker_rx) = spawn_inference_worker();
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        hotkey: HotKey,
+        config: HotkeyConfig,
+        hotkey_manager: GlobalHotKeyManager,
+    ) -> Self {
+        let (worker_tx, worker_rx, worker_handle) = spawn_inference_worker();
         Self {
             recorder: AudioRecorder::default(),
             worker_tx,
             worker_rx,
+            worker_handle: Some(worker_handle),
             transcription: String::new(),
             partial_text: String::new(),
-            status_text: format!("Idle ({BACKEND_NAME})"),
             recording: false,
             transcribing: false,
+
             pinned: true,
-            auto_clipboard: false,
+            auto_action: AutoAction::Paste,
+            hotkey_config: config.clone(),
+            pending_hotkey: config,
+
+            current_hotkey: hotkey,
+            hotkey_manager,
+
+            paste_target_window: None,
+            title_warning: None,
+
+            show_settings: false,
         }
     }
 
+    // ── Recording ───────────────────────────────────────────────────
+
     fn start_recording(&mut self) {
+        self.paste_target_window = get_active_window();
+        self.title_warning = None;
+
         match self.recorder.start() {
             Ok(()) => {
                 self.recording = true;
                 self.partial_text.clear();
-                self.status_text = "Recording...".to_owned();
             }
             Err(error) => {
-                self.status_text = format!("Audio error: {error}");
+                eprintln!("Audio error: {error}");
             }
         }
     }
 
     fn stop_recording(&mut self) {
-        // Drain remaining samples
         let remaining = self.recorder.drain_new_samples();
         if !remaining.is_empty() {
             let _ = self
                 .worker_tx
                 .send(InferenceCommand::PushSamples(remaining));
         }
-        // Stop the audio stream — capture any samples that arrived between drain and stop
         match self.recorder.stop() {
             Ok(leftover) => {
                 if !leftover.is_empty() {
@@ -111,19 +305,16 @@ impl SpeechApp {
         }
         self.recording = false;
         self.transcribing = true;
-        self.status_text = "Finalizing...".to_owned();
         if let Err(error) = self.worker_tx.send(InferenceCommand::Finalize) {
             self.transcribing = false;
-            self.status_text = format!("Worker error: {error}");
+            eprintln!("Worker error: {error}");
         }
     }
 
-    /// Drain samples from recorder and send to streaming worker
     fn drain_streaming_samples(&mut self) {
         if !self.recording {
             return;
         }
-
         let samples = self.recorder.drain_new_samples();
         if !samples.is_empty() {
             let _ = self
@@ -132,23 +323,55 @@ impl SpeechApp {
         }
     }
 
-    fn copy_transcription(&mut self) {
+    // ── Clipboard / paste ───────────────────────────────────────────
+
+    fn copy_to_clipboard(&self) {
+        if let Err(e) = Clipboard::new()
+            .and_then(|mut cb| cb.set_text(self.transcription.clone()))
+        {
+            eprintln!("Clipboard error: {e}");
+        }
+    }
+
+    fn handle_auto_action(&mut self) {
         if self.transcription.trim().is_empty() {
-            self.status_text = "Nothing to copy.".to_owned();
             return;
         }
+        match self.auto_action {
+            AutoAction::None => {}
+            AutoAction::Copy => self.copy_to_clipboard(),
+            AutoAction::Paste => {
+                let current_window = get_active_window();
+                let window_matches = match (&self.paste_target_window, &current_window) {
+                    (Some(target), Some(current)) => target == current,
+                    _ => false,
+                };
 
-        match Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(self.transcription.clone()))
-        {
-            Ok(()) => {
-                self.status_text = "Copied to clipboard.".to_owned();
-            }
-            Err(error) => {
-                self.status_text = format!("Clipboard error: {error}");
+                if !window_matches {
+                    self.copy_to_clipboard();
+                    self.title_warning = Some((
+                        "Paste skipped: window changed".to_owned(),
+                        Instant::now(),
+                    ));
+                    return;
+                }
+
+                let old_clipboard = Clipboard::new()
+                    .and_then(|mut cb| cb.get_text())
+                    .ok();
+                self.copy_to_clipboard();
+                simulate_paste();
+                if let Some(old) = old_clipboard {
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(200));
+                        let _ = Clipboard::new().and_then(|mut cb| cb.set_text(old));
+                    });
+                }
             }
         }
     }
+
+    // ── Polling ─────────────────────────────────────────────────────
 
     fn poll_worker(&mut self) {
         loop {
@@ -159,14 +382,10 @@ impl SpeechApp {
                         Ok(text) => {
                             self.transcription = text;
                             self.partial_text.clear();
-                            if self.auto_clipboard {
-                                self.copy_transcription();
-                            } else {
-                                self.status_text = "Transcription complete.".to_owned();
-                            }
+                            self.handle_auto_action();
                         }
                         Err(error) => {
-                            self.status_text = format!("Inference failed: {error}");
+                            eprintln!("Inference failed: {error}");
                         }
                     }
                 }
@@ -176,64 +395,80 @@ impl SpeechApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.transcribing = false;
-                    self.status_text = "Inference worker stopped.".to_owned();
                     break;
                 }
             }
         }
     }
 
-    fn recording_indicator(&self, ui: &mut egui::Ui) {
-        let height = 24.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height),
-            egui::Sense::hover(),
-        );
-        let painter = ui.painter_at(rect);
+    fn poll_global_hotkey(&mut self) {
+        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.id == self.current_hotkey.id()
+                && event.state == global_hotkey::HotKeyState::Pressed
+            {
+                if self.transcribing {
+                    return;
+                }
+                if self.recording {
+                    self.stop_recording();
+                } else {
+                    self.start_recording();
+                }
+            }
+        }
+    }
+
+    // ── Hotkey management ───────────────────────────────────────────
+
+    fn apply_hotkey(&mut self) {
+        let new_hotkey = self.pending_hotkey.to_hotkey();
+        if new_hotkey.id() == self.current_hotkey.id() {
+            return;
+        }
+
+        if let Err(e) = self.hotkey_manager.unregister(self.current_hotkey) {
+            eprintln!("Failed to unregister old hotkey: {e}");
+        }
+        match self.hotkey_manager.register(new_hotkey) {
+            Ok(()) => {
+                self.current_hotkey = new_hotkey;
+                self.hotkey_config = self.pending_hotkey.clone();
+            }
+            Err(e) => {
+                eprintln!("Failed to register new hotkey: {e}, restoring old");
+                let _ = self.hotkey_manager.register(self.current_hotkey);
+                self.pending_hotkey = self.hotkey_config.clone();
+            }
+        }
+    }
+
+    // ── Title ───────────────────────────────────────────────────────
+
+    fn window_title(&mut self) -> String {
+        if let Some((ref msg, when)) = self.title_warning {
+            if when.elapsed() < Duration::from_secs(5) {
+                return format!("STT — {msg}");
+            }
+            self.title_warning = None;
+        }
 
         if self.recording {
-            let time = ui.ctx().input(|input| input.time) as f32;
-            let pulse = 0.5 + 0.5 * (time * 5.0).sin();
-            let radius = 6.0 + pulse * 3.0;
-            let alpha = (160.0 + pulse * 95.0) as u8;
-            let center = egui::pos2(rect.left() + 12.0, rect.center().y);
-            painter.circle_filled(
-                center,
-                radius,
-                Color32::from_rgba_unmultiplied(220, 40, 40, alpha),
-            );
-            painter.text(
-                egui::pos2(center.x + 14.0, rect.center().y - 8.0),
-                egui::Align2::LEFT_TOP,
-                "Recording...",
-                egui::TextStyle::Body.resolve(ui.style()),
-                Color32::from_rgb(220, 40, 40),
-            );
+            "STT \u{23FA} Recording...".to_owned()
         } else if self.transcribing {
-            painter.text(
-                rect.left_center() + egui::vec2(0.0, -8.0),
-                egui::Align2::LEFT_TOP,
-                "Transcribing...",
-                egui::TextStyle::Body.resolve(ui.style()),
-                Color32::from_rgb(240, 180, 60),
-            );
+            "STT — Transcribing...".to_owned()
         } else {
-            painter.text(
-                rect.left_center() + egui::vec2(0.0, -8.0),
-                egui::Align2::LEFT_TOP,
-                format!("Ready ({BACKEND_NAME})"),
-                egui::TextStyle::Body.resolve(ui.style()),
-                Color32::GRAY,
-            );
+            "STT — Ready".to_owned()
         }
     }
 }
 
+// ── eframe::App ─────────────────────────────────────────────────────
+
 impl eframe::App for SpeechApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.poll_global_hotkey();
 
-        // Drain audio samples for streaming
         if self.recording {
             self.drain_streaming_samples();
         }
@@ -241,24 +476,102 @@ impl eframe::App for SpeechApp {
         if self.recording || self.transcribing {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+        ctx.request_repaint_after(Duration::from_millis(200));
 
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+
+        // ── Settings viewport (separate OS window) ──────────────
+        if self.show_settings {
+            let was_pinned = self.pinned;
+            let mut should_apply_hotkey = false;
+            let mut should_close = false;
+
+            ctx.show_viewport_immediate(
+                ViewportId::from_hash_of("stt_settings"),
+                ViewportBuilder::default()
+                    .with_title("\u{2699}\u{FE0F} STT Settings")
+                    .with_inner_size([380.0, 400.0])
+                    .with_resizable(false),
+                |inner_ctx, class| {
+                    if inner_ctx.input(|i| i.viewport().close_requested()) {
+                        should_close = true;
+                    }
+
+                    // If embedded (backend doesn't support multi-viewport),
+                    // wrap in an egui::Window
+                    if class == ViewportClass::Embedded {
+                        let mut open = true;
+                        egui::Window::new("\u{2699}\u{FE0F} Settings")
+                            .open(&mut open)
+                            .resizable(false)
+                            .collapsible(false)
+                            .default_width(360.0)
+                            .show(inner_ctx, |ui| {
+                                Self::draw_settings_ui(
+                                    ui,
+                                    &mut self.pending_hotkey,
+                                    &self.hotkey_config,
+                                    &mut self.auto_action,
+                                    &mut self.pinned,
+                                    &mut should_apply_hotkey,
+                                );
+                            });
+                        if !open {
+                            should_close = true;
+                        }
+                    } else {
+                        egui::CentralPanel::default().show(inner_ctx, |ui| {
+                            Self::draw_settings_ui(
+                                ui,
+                                &mut self.pending_hotkey,
+                                &self.hotkey_config,
+                                &mut self.auto_action,
+                                &mut self.pinned,
+                                &mut should_apply_hotkey,
+                            );
+                        });
+                    }
+                },
+            );
+
+            if should_close {
+                self.show_settings = false;
+            }
+            if should_apply_hotkey {
+                self.apply_hotkey();
+            }
+            if self.pinned != was_pinned {
+                let level = if self.pinned {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            }
+        }
+
+        // ── Main panel ──────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.visuals_mut().widgets.active.bg_stroke =
-                Stroke::new(1.5, Color32::from_rgb(220, 40, 40));
-
-            let btn_size = egui::vec2(120.0, 48.0);
-            let btn_font = 22.0;
-
             ui.horizontal(|ui| {
-                let label = if self.recording { "Stop" } else { "Record" };
-                let record_clicked = ui
+                // Record / Stop
+                let icon = if self.recording {
+                    "\u{23F9}"
+                } else {
+                    "\u{23FA}"
+                };
+                let tooltip = if self.recording {
+                    "Stop recording".to_owned()
+                } else {
+                    format!("Record ({})", self.hotkey_config.display())
+                };
+                if ui
                     .add_enabled(
                         !self.transcribing,
-                        egui::Button::new(RichText::new(label).size(btn_font).strong())
-                            .min_size(btn_size),
+                        egui::Button::new(RichText::new(icon).size(18.0)),
                     )
-                    .clicked();
-                if record_clicked {
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
                     if self.recording {
                         self.stop_recording();
                     } else {
@@ -266,74 +579,160 @@ impl eframe::App for SpeechApp {
                     }
                 }
 
+                // Copy
                 if ui
-                    .add(
-                        egui::Button::new(RichText::new("Copy").size(btn_font))
-                            .min_size(btn_size),
-                    )
+                    .add(egui::Button::new(RichText::new("\u{1F4CB}").size(18.0)))
+                    .on_hover_text("Copy to clipboard")
                     .clicked()
                 {
-                    self.copy_transcription();
+                    self.copy_to_clipboard();
                 }
 
-                let pin_label = if self.pinned { "Unpin" } else { "Pin" };
+                // Settings
                 if ui
-                    .add(
-                        egui::Button::new(RichText::new(pin_label).size(btn_font))
-                            .min_size(egui::vec2(90.0, btn_size.y)),
-                    )
+                    .add(egui::Button::new(RichText::new("\u{2699}").size(18.0)))
+                    .on_hover_text("Settings")
                     .clicked()
                 {
-                    self.pinned = !self.pinned;
-                    let level = if self.pinned {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    };
-                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                    self.show_settings = !self.show_settings;
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.auto_clipboard, "Auto-copy to clipboard");
-            });
+            // Textarea — fills all remaining space
+            let text = if self.recording && !self.partial_text.is_empty() {
+                &self.partial_text
+            } else {
+                &self.transcription
+            };
+            let mut display = text.to_owned();
+            let available = ui.available_size();
+            ui.add_sized(
+                available,
+                egui::TextEdit::multiline(&mut display).desired_width(f32::INFINITY),
+            );
+            if !self.recording {
+                self.transcription = display;
+            }
+        });
+    }
 
-            ui.add_space(4.0);
-            self.recording_indicator(ui);
-            ui.label(RichText::new(&self.status_text).small());
-            ui.add_space(4.0);
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.worker_tx.send(InferenceCommand::Shutdown);
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Show partial text in gray while recording (streaming)
-                if self.recording && !self.partial_text.is_empty() {
-                    ui.label(
-                        RichText::new(&self.partial_text)
-                            .italics()
-                            .color(Color32::GRAY),
-                    );
-                    ui.add_space(4.0);
-                }
+// ── Settings UI (shared between viewport and embedded fallback) ─────
 
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.transcription)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(14)
-                        .lock_focus(true),
-                );
-            });
+impl SpeechApp {
+    fn draw_settings_ui(
+        ui: &mut egui::Ui,
+        pending: &mut HotkeyConfig,
+        current: &HotkeyConfig,
+        auto_action: &mut AutoAction,
+        pinned: &mut bool,
+        apply_clicked: &mut bool,
+    ) {
+        ui.heading("Hotkey");
+        ui.label("Global keyboard shortcut to start/stop recording.");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if cfg!(target_os = "macos") {
+                ui.checkbox(&mut pending.use_super, "Cmd");
+            } else {
+                ui.checkbox(&mut pending.use_super, "Super");
+            }
+            ui.checkbox(&mut pending.use_ctrl, "Ctrl");
+            ui.checkbox(&mut pending.use_shift, "Shift");
+            if cfg!(target_os = "macos") {
+                ui.checkbox(&mut pending.use_alt, "Option");
+            } else {
+                ui.checkbox(&mut pending.use_alt, "Alt");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Key:");
+            egui::ComboBox::from_id_salt("hotkey_key")
+                .width(55.0)
+                .selected_text(KEY_OPTIONS[pending.key_idx].0)
+                .show_ui(ui, |ui| {
+                    for (i, (name, _)) in KEY_OPTIONS.iter().enumerate() {
+                        ui.selectable_value(&mut pending.key_idx, i, *name);
+                    }
+                });
+        });
+
+        ui.add_space(4.0);
+
+        let pending_display = pending.display();
+        let current_display = current.display();
+        let changed = pending_display != current_display;
+
+        ui.horizontal(|ui| {
+            ui.label(format!("Current: {current_display}"));
+            if changed && ui.button("Apply").clicked() {
+                *apply_clicked = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // ── After transcription ─────────────────────────────────
+        ui.heading("After transcription");
+        ui.add_space(4.0);
+
+        for action in AutoAction::ALL {
+            ui.radio_value(auto_action, action, action.label());
+        }
+
+        ui.add_space(4.0);
+        ui.indent("auto_action_help", |ui| {
+            ui.label(RichText::new(auto_action.description()).weak().small());
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // ── Window ──────────────────────────────────────────────
+        ui.heading("Window");
+        ui.add_space(4.0);
+
+        ui.checkbox(pinned, "Always on top");
+        ui.indent("pin_help", |ui| {
+            ui.label(
+                RichText::new("Keep the STT window above all other windows.")
+                    .weak()
+                    .small(),
+            );
         });
     }
 }
 
-fn spawn_inference_worker() -> (Sender<InferenceCommand>, Receiver<InferenceEvent>) {
+// ── Inference worker ────────────────────────────────────────────────
+
+fn spawn_inference_worker() -> (
+    Sender<InferenceCommand>,
+    Receiver<InferenceEvent>,
+    thread::JoinHandle<()>,
+) {
     let (command_tx, command_rx) = mpsc::channel::<InferenceCommand>();
     let (event_tx, event_rx) = mpsc::channel::<InferenceEvent>();
 
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mut engine: Option<StreamingEngine> = None;
 
         while let Ok(command) = command_rx.recv() {
-            // Lazily initialize
+            if matches!(command, InferenceCommand::Shutdown) {
+                break;
+            }
+
             if engine.is_none() {
                 match WhisperCppTranscriber::new() {
                     Ok(t) => engine = Some(StreamingEngine::new(t)),
@@ -357,7 +756,6 @@ fn spawn_inference_worker() -> (Sender<InferenceCommand>, Receiver<InferenceEven
                     }
                 }
                 InferenceCommand::Finalize => {
-                    // Drain all pending PushSamples without running inference
                     while let Ok(cmd) = command_rx.try_recv() {
                         if let InferenceCommand::PushSamples(samples) = cmd {
                             engine.append_samples(&samples);
@@ -368,9 +766,10 @@ fn spawn_inference_worker() -> (Sender<InferenceCommand>, Receiver<InferenceEven
                         break;
                     }
                 }
+                InferenceCommand::Shutdown => unreachable!(),
             }
         }
     });
 
-    (command_tx, event_rx)
+    (command_tx, event_rx, handle)
 }

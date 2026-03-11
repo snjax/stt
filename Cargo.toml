@@ -15,6 +15,7 @@ arboard = "3.4"
 cpal = "0.16"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
+global-hotkey = "0.7.0"
 hound = "3.5"
 
 [build-dependencies]
