@@ -53,6 +53,18 @@ fn main() {
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=gomp");
         if cfg!(feature = "cuda") {
+            // Find CUDA library path
+            for candidate in &[
+                "/opt/cuda/targets/x86_64-linux/lib",
+                "/opt/cuda/lib64",
+                "/usr/local/cuda/lib64",
+                "/usr/lib/x86_64-linux-gnu",
+            ] {
+                if std::path::Path::new(candidate).join("libcudart.so").exists() {
+                    println!("cargo:rustc-link-search=native={candidate}");
+                    break;
+                }
+            }
             println!("cargo:rustc-link-lib=static=ggml-cuda");
             println!("cargo:rustc-link-lib=cuda");
             println!("cargo:rustc-link-lib=cublas");

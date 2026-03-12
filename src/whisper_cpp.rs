@@ -240,7 +240,7 @@ impl WhisperCppTranscriber {
 
         let lang = CString::new("auto").unwrap();
         params.language = lang.as_ptr();
-        params.no_context = true;
+        params.no_context = false;
         params.single_segment = false;
         params.print_special = false;
         params.print_progress = false;

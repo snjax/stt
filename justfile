@@ -7,20 +7,35 @@ model_name := "ggml-large-v3-turbo.bin"
 app_dir := "/Applications/" + app_name + ".app"
 contents := app_dir + "/Contents"
 
+# Linux paths
+linux_bin_dir := env("HOME") / ".local/bin"
+linux_share_dir := env("HOME") / ".local/share"
+linux_model_dir := linux_share_dir / "stt/models"
+
 # Detect OS
 os := os()
 
 # ── Build ────────────────────────────────────────────────────────────
 
-# Build release binary with platform-appropriate features
+# Build release binary with platform-appropriate features (auto-detects CUDA on Linux)
 build:
     @if [ "{{os}}" = "macos" ]; then \
         cargo build --release --features metal; \
     elif [ "{{os}}" = "linux" ]; then \
-        cargo build --release; \
+        if command -v nvcc >/dev/null 2>&1; then \
+            echo "CUDA detected, building with GPU support..."; \
+            cargo build --release --features cuda; \
+        else \
+            echo "No CUDA found, building CPU-only..."; \
+            cargo build --release; \
+        fi; \
     else \
         echo "Unsupported OS: {{os}}"; exit 1; \
     fi
+
+# Build release binary without GPU (CPU only)
+build-cpu:
+    cargo build --release
 
 # Build debug binary
 build-debug:
@@ -129,9 +144,47 @@ _install-os:
 
 [linux]
 _install-os:
-    @echo "Linux install: not implemented yet"
-    @echo "For now, run: ./target/release/stt"
-    @exit 1
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "=== Installing STT for Linux ==="
+
+    # Binary
+    mkdir -p "{{linux_bin_dir}}"
+    cp target/release/stt "{{linux_bin_dir}}/stt"
+    echo "Installed binary to {{linux_bin_dir}}/stt"
+
+    # Model
+    mkdir -p "{{linux_model_dir}}"
+    if [ -f "models/{{model_name}}" ]; then
+        echo "Copying model ($(du -h "models/{{model_name}}" | cut -f1))..."
+        cp "models/{{model_name}}" "{{linux_model_dir}}/{{model_name}}"
+    else
+        echo "WARNING: models/{{model_name}} not found"
+        echo "  Run: just download-model"
+    fi
+
+    # Desktop entry
+    mkdir -p "{{linux_share_dir}}/applications"
+    cat > "{{linux_share_dir}}/applications/stt.desktop" << EOF
+    [Desktop Entry]
+    Name=STT
+    Comment=Speech to Text transcription
+    Exec=env STT_WHISPER_MODEL={{linux_model_dir}}/{{model_name}} {{linux_bin_dir}}/stt
+    Terminal=false
+    Type=Application
+    Categories=AudioVideo;Audio;Utility;
+    Keywords=speech;transcription;whisper;stt;
+    EOF
+
+    echo ""
+    echo "Installed:"
+    echo "  Binary:  {{linux_bin_dir}}/stt"
+    echo "  Model:   {{linux_model_dir}}/{{model_name}}"
+    echo "  Desktop: {{linux_share_dir}}/applications/stt.desktop"
+    echo ""
+    echo "Make sure {{linux_bin_dir}} is in your PATH."
+    echo "Run 'stt' or launch from your app menu."
 
 [windows]
 _install-os:
@@ -151,8 +204,27 @@ _uninstall-os:
 
 [linux]
 _uninstall-os:
-    @echo "Linux uninstall: not implemented yet"
-    @exit 1
+    #!/usr/bin/env bash
+    set -euo pipefail
+    removed=0
+    for f in "{{linux_bin_dir}}/stt" \
+             "{{linux_share_dir}}/applications/stt.desktop"; do
+        if [ -f "$f" ]; then
+            rm "$f"
+            echo "Removed $f"
+            removed=1
+        fi
+    done
+    if [ -d "{{linux_model_dir}}" ]; then
+        rm -rf "{{linux_model_dir}}"
+        echo "Removed {{linux_model_dir}}"
+        removed=1
+    fi
+    # Clean up empty parent dir
+    rmdir "{{linux_share_dir}}/stt" 2>/dev/null || true
+    if [ "$removed" = 0 ]; then
+        echo "Nothing to uninstall"
+    fi
 
 [windows]
 _uninstall-os:

@@ -1,7 +1,13 @@
 mod app;
 mod audio;
+#[cfg(target_os = "linux")]
+mod evdev_hotkey;
 mod paste;
 mod streaming;
+#[cfg(target_os = "linux")]
+mod wayland_hotkey;
+#[cfg(target_os = "linux")]
+mod wayland_paste;
 mod whisper_cpp;
 
 use std::{

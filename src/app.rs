@@ -1,27 +1,29 @@
 use std::{
+    fs,
+    path::PathBuf,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use arboard::Clipboard;
 use eframe::egui::{self, RichText, ViewportBuilder, ViewportClass, ViewportId};
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager,
     hotkey::{Code, HotKey, Modifiers},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     audio::AudioRecorder,
-    paste::{get_active_window, simulate_paste},
+    paste::{clipboard_copy, clipboard_get, get_active_window},
     streaming::StreamingEngine,
     whisper_cpp::WhisperCppTranscriber,
 };
 
 // ── AutoAction ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum AutoAction {
     None,
     Copy,
@@ -96,7 +98,7 @@ const KEY_OPTIONS: &[(&str, Code)] = &[
     ("F12", Code::F12),
 ];
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct HotkeyConfig {
     use_super: bool,
     use_ctrl: bool,
@@ -159,6 +161,75 @@ impl HotkeyConfig {
         parts.push(KEY_OPTIONS[self.key_idx].0);
         parts.join("+")
     }
+
+    /// Convert to XDG portal trigger format (GTK accelerator syntax).
+    #[cfg(target_os = "linux")]
+    fn to_portal_trigger(&self) -> String {
+        let mut trigger = String::new();
+        if self.use_super {
+            trigger.push_str("<Super>");
+        }
+        if self.use_ctrl {
+            trigger.push_str("<Control>");
+        }
+        if self.use_alt {
+            trigger.push_str("<Alt>");
+        }
+        if self.use_shift {
+            trigger.push_str("<Shift>");
+        }
+        trigger.push_str(KEY_OPTIONS[self.key_idx].0);
+        trigger
+    }
+}
+
+// ── Hotkey backend ──────────────────────────────────────────────────
+
+enum HotkeyBackend {
+    GlobalHotkey {
+        manager: GlobalHotKeyManager,
+        hotkey: HotKey,
+    },
+    #[cfg(target_os = "linux")]
+    Portal {
+        listener: crate::wayland_hotkey::WaylandHotkeyListener,
+    },
+    #[cfg(target_os = "linux")]
+    Evdev {
+        listener: crate::evdev_hotkey::EvdevHotkeyListener,
+    },
+}
+
+impl HotkeyBackend {
+    fn hotkey_display(&self, config: &HotkeyConfig) -> String {
+        match self {
+            HotkeyBackend::GlobalHotkey { .. } => config.display(),
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Portal { listener } => listener.assigned_trigger.clone(),
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Evdev { .. } => config.display(),
+        }
+    }
+
+    fn is_configurable(&self) -> bool {
+        match self {
+            HotkeyBackend::GlobalHotkey { .. } => true,
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Evdev { .. } => true,
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Portal { .. } => false,
+        }
+    }
+}
+
+fn setup_global_hotkey(config: &HotkeyConfig) -> Result<HotkeyBackend> {
+    let manager = GlobalHotKeyManager::new()
+        .map_err(|e| anyhow::anyhow!("failed to create hotkey manager: {e}"))?;
+    let hotkey = config.to_hotkey();
+    manager
+        .register(hotkey)
+        .map_err(|e| anyhow::anyhow!("failed to register hotkey: {e}"))?;
+    Ok(HotkeyBackend::GlobalHotkey { manager, hotkey })
 }
 
 // ── Worker protocol ─────────────────────────────────────────────────
@@ -174,24 +245,86 @@ enum InferenceEvent {
     PartialResult(String),
 }
 
+// ── Persistent settings ─────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    hotkey: HotkeyConfig,
+    auto_action: AutoAction,
+    pinned: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            hotkey: HotkeyConfig::default_config(),
+            auto_action: AutoAction::Paste,
+            pinned: true,
+        }
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("stt").join("settings.json"))
+}
+
+fn load_settings() -> Settings {
+    let Some(path) = settings_path() else {
+        return Settings::default();
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return Settings::default();
+    };
+    match serde_json::from_str::<Settings>(&data) {
+        Ok(mut s) => {
+            // Clamp key_idx to valid range
+            if s.hotkey.key_idx >= KEY_OPTIONS.len() {
+                s.hotkey.key_idx = HotkeyConfig::default_config().key_idx;
+            }
+            s
+        }
+        Err(e) => {
+            eprintln!("Failed to parse settings: {e}");
+            Settings::default()
+        }
+    }
+}
+
+fn save_settings(settings: &Settings) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(settings) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&path, json) {
+                eprintln!("Failed to save settings: {e}");
+            }
+        }
+        Err(e) => eprintln!("Failed to serialize settings: {e}"),
+    }
+}
+
 // ── Entry point ─────────────────────────────────────────────────────
 
 pub fn run_gui() -> Result<()> {
-    let hotkey_manager = GlobalHotKeyManager::new()
-        .map_err(|e| anyhow::anyhow!("failed to create hotkey manager: {e}"))?;
+    let settings = load_settings();
+    let config = settings.hotkey.clone();
 
-    let config = HotkeyConfig::default_config();
-    let hotkey = config.to_hotkey();
-    hotkey_manager
-        .register(hotkey)
-        .map_err(|e| anyhow::anyhow!("failed to register hotkey: {e}"))?;
+    let hotkey_backend = create_hotkey_backend(&config)?;
+
+    let mut viewport = ViewportBuilder::default()
+        .with_title("STT — Ready")
+        .with_inner_size([200.0, 160.0])
+        .with_min_inner_size([140.0, 100.0]);
+    if settings.pinned {
+        viewport = viewport.with_always_on_top();
+    }
 
     let options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_title("STT — Ready")
-            .with_inner_size([200.0, 160.0])
-            .with_min_inner_size([140.0, 100.0])
-            .with_always_on_top(),
+        viewport,
         ..Default::default()
     };
 
@@ -199,11 +332,56 @@ pub fn run_gui() -> Result<()> {
         "stt",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(SpeechApp::new(cc, hotkey, config, hotkey_manager)))
+            Ok(Box::new(SpeechApp::new(cc, settings, hotkey_backend)))
         }),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(())
+}
+
+fn create_hotkey_backend(config: &HotkeyConfig) -> Result<HotkeyBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY")
+            .map_or(false, |v| !v.is_empty());
+
+        if is_wayland {
+            // Try xdg-desktop-portal GlobalShortcuts first
+            let trigger = config.to_portal_trigger();
+            match crate::wayland_hotkey::WaylandHotkeyListener::new(&trigger) {
+                Ok(listener) => {
+                    eprintln!(
+                        "Using Wayland portal hotkey: {}",
+                        listener.assigned_trigger
+                    );
+                    return Ok(HotkeyBackend::Portal { listener });
+                }
+                Err(e) => {
+                    eprintln!("Wayland portal unavailable ({e}), trying evdev...");
+                }
+            }
+
+            // Fall back to evdev (reads /dev/input directly)
+            let key_name = KEY_OPTIONS[config.key_idx].0;
+            match crate::evdev_hotkey::EvdevHotkeyListener::new(
+                key_name,
+                config.use_super,
+                config.use_ctrl,
+                config.use_shift,
+                config.use_alt,
+            ) {
+                Ok(listener) => {
+                    eprintln!("Using evdev hotkey: {}", config.display());
+                    return Ok(HotkeyBackend::Evdev { listener });
+                }
+                Err(e) => {
+                    eprintln!("evdev unavailable ({e}), falling back to X11 hotkey");
+                }
+            }
+        }
+    }
+
+    setup_global_hotkey(config)
 }
 
 // ── App state ───────────────────────────────────────────────────────
@@ -225,12 +403,15 @@ pub struct SpeechApp {
     pending_hotkey: HotkeyConfig,
 
     // Hotkey management
-    current_hotkey: HotKey,
-    hotkey_manager: GlobalHotKeyManager,
+    hotkey_backend: HotkeyBackend,
 
     // Paste target tracking
     paste_target_window: Option<String>,
     title_warning: Option<(String, Instant)>,
+
+    // Wayland RemoteDesktop portal for paste simulation
+    #[cfg(target_os = "linux")]
+    wayland_paster: Option<crate::wayland_paste::WaylandPaster>,
 
     // UI
     show_settings: bool,
@@ -239,11 +420,27 @@ pub struct SpeechApp {
 impl SpeechApp {
     fn new(
         _cc: &eframe::CreationContext<'_>,
-        hotkey: HotKey,
-        config: HotkeyConfig,
-        hotkey_manager: GlobalHotKeyManager,
+        settings: Settings,
+        hotkey_backend: HotkeyBackend,
     ) -> Self {
         let (worker_tx, worker_rx, worker_handle) = spawn_inference_worker();
+
+        #[cfg(target_os = "linux")]
+        let wayland_paster = if std::env::var("WAYLAND_DISPLAY")
+            .map_or(false, |v| !v.is_empty())
+        {
+            match crate::wayland_paste::WaylandPaster::new() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("RemoteDesktop portal unavailable ({e}), paste will use fallback");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let pending = settings.hotkey.clone();
         Self {
             recorder: AudioRecorder::default(),
             worker_tx,
@@ -254,16 +451,18 @@ impl SpeechApp {
             recording: false,
             transcribing: false,
 
-            pinned: true,
-            auto_action: AutoAction::Paste,
-            hotkey_config: config.clone(),
-            pending_hotkey: config,
+            pinned: settings.pinned,
+            auto_action: settings.auto_action,
+            hotkey_config: settings.hotkey,
+            pending_hotkey: pending,
 
-            current_hotkey: hotkey,
-            hotkey_manager,
+            hotkey_backend,
 
             paste_target_window: None,
             title_warning: None,
+
+            #[cfg(target_os = "linux")]
+            wayland_paster,
 
             show_settings: false,
         }
@@ -326,11 +525,18 @@ impl SpeechApp {
     // ── Clipboard / paste ───────────────────────────────────────────
 
     fn copy_to_clipboard(&self) {
-        if let Err(e) = Clipboard::new()
-            .and_then(|mut cb| cb.set_text(self.transcription.clone()))
+        clipboard_copy(&self.transcription);
+    }
+
+    fn do_paste(&self) {
+        #[cfg(target_os = "linux")]
         {
-            eprintln!("Clipboard error: {e}");
+            crate::paste::simulate_paste(self.wayland_paster.as_ref());
+            return;
         }
+
+        #[cfg(target_os = "macos")]
+        crate::paste::simulate_paste();
     }
 
     fn handle_auto_action(&mut self) {
@@ -344,6 +550,7 @@ impl SpeechApp {
                 let current_window = get_active_window();
                 let window_matches = match (&self.paste_target_window, &current_window) {
                     (Some(target), Some(current)) => target == current,
+                    (None, None) => true, // detection unavailable → trust the user
                     _ => false,
                 };
 
@@ -356,15 +563,13 @@ impl SpeechApp {
                     return;
                 }
 
-                let old_clipboard = Clipboard::new()
-                    .and_then(|mut cb| cb.get_text())
-                    .ok();
+                let old_clipboard = clipboard_get();
                 self.copy_to_clipboard();
-                simulate_paste();
+                self.do_paste();
                 if let Some(old) = old_clipboard {
                     thread::spawn(move || {
                         thread::sleep(Duration::from_millis(200));
-                        let _ = Clipboard::new().and_then(|mut cb| cb.set_text(old));
+                        clipboard_copy(&old);
                     });
                 }
             }
@@ -401,19 +606,30 @@ impl SpeechApp {
         }
     }
 
-    fn poll_global_hotkey(&mut self) {
-        if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.id == self.current_hotkey.id()
-                && event.state == global_hotkey::HotKeyState::Pressed
-            {
-                if self.transcribing {
-                    return;
-                }
-                if self.recording {
-                    self.stop_recording();
+    fn poll_hotkey(&mut self) {
+        let pressed = match &self.hotkey_backend {
+            HotkeyBackend::GlobalHotkey { hotkey, .. } => {
+                if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                    event.id == hotkey.id()
+                        && event.state == global_hotkey::HotKeyState::Pressed
                 } else {
-                    self.start_recording();
+                    false
                 }
+            }
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Portal { listener } => listener.try_recv(),
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Evdev { listener } => listener.try_recv(),
+        };
+
+        if pressed {
+            if self.transcribing {
+                return;
+            }
+            if self.recording {
+                self.stop_recording();
+            } else {
+                self.start_recording();
             }
         }
     }
@@ -421,25 +637,59 @@ impl SpeechApp {
     // ── Hotkey management ───────────────────────────────────────────
 
     fn apply_hotkey(&mut self) {
-        let new_hotkey = self.pending_hotkey.to_hotkey();
-        if new_hotkey.id() == self.current_hotkey.id() {
-            return;
-        }
+        match &mut self.hotkey_backend {
+            HotkeyBackend::GlobalHotkey { manager, hotkey } => {
+                let new_hotkey = self.pending_hotkey.to_hotkey();
+                if new_hotkey.id() == hotkey.id() {
+                    return;
+                }
 
-        if let Err(e) = self.hotkey_manager.unregister(self.current_hotkey) {
-            eprintln!("Failed to unregister old hotkey: {e}");
-        }
-        match self.hotkey_manager.register(new_hotkey) {
-            Ok(()) => {
-                self.current_hotkey = new_hotkey;
-                self.hotkey_config = self.pending_hotkey.clone();
+                if let Err(e) = manager.unregister(*hotkey) {
+                    eprintln!("Failed to unregister old hotkey: {e}");
+                }
+                match manager.register(new_hotkey) {
+                    Ok(()) => {
+                        *hotkey = new_hotkey;
+                        self.hotkey_config = self.pending_hotkey.clone();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to register new hotkey: {e}, restoring old");
+                        let _ = manager.register(*hotkey);
+                        self.pending_hotkey = self.hotkey_config.clone();
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to register new hotkey: {e}, restoring old");
-                let _ = self.hotkey_manager.register(self.current_hotkey);
-                self.pending_hotkey = self.hotkey_config.clone();
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Evdev { listener } => {
+                let key_name = KEY_OPTIONS[self.pending_hotkey.key_idx].0;
+                match crate::evdev_hotkey::EvdevHotkeyListener::new(
+                    key_name,
+                    self.pending_hotkey.use_super,
+                    self.pending_hotkey.use_ctrl,
+                    self.pending_hotkey.use_shift,
+                    self.pending_hotkey.use_alt,
+                ) {
+                    Ok(new_listener) => {
+                        *listener = new_listener;
+                        self.hotkey_config = self.pending_hotkey.clone();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to apply evdev hotkey: {e}");
+                        self.pending_hotkey = self.hotkey_config.clone();
+                    }
+                }
             }
+            #[cfg(target_os = "linux")]
+            HotkeyBackend::Portal { .. } => {} // managed by compositor
         }
+    }
+
+    fn save_current_settings(&self) {
+        save_settings(&Settings {
+            hotkey: self.hotkey_config.clone(),
+            auto_action: self.auto_action,
+            pinned: self.pinned,
+        });
     }
 
     // ── Title ───────────────────────────────────────────────────────
@@ -467,7 +717,7 @@ impl SpeechApp {
 impl eframe::App for SpeechApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
-        self.poll_global_hotkey();
+        self.poll_hotkey();
 
         if self.recording {
             self.drain_streaming_samples();
@@ -483,8 +733,11 @@ impl eframe::App for SpeechApp {
         // ── Settings viewport (separate OS window) ──────────────
         if self.show_settings {
             let was_pinned = self.pinned;
+            let was_auto_action = self.auto_action;
             let mut should_apply_hotkey = false;
             let mut should_close = false;
+            let hotkey_configurable = self.hotkey_backend.is_configurable();
+            let hotkey_display = self.hotkey_backend.hotkey_display(&self.hotkey_config);
 
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("stt_settings"),
@@ -511,6 +764,8 @@ impl eframe::App for SpeechApp {
                                     ui,
                                     &mut self.pending_hotkey,
                                     &self.hotkey_config,
+                                    &hotkey_display,
+                                    hotkey_configurable,
                                     &mut self.auto_action,
                                     &mut self.pinned,
                                     &mut should_apply_hotkey,
@@ -525,6 +780,8 @@ impl eframe::App for SpeechApp {
                                 ui,
                                 &mut self.pending_hotkey,
                                 &self.hotkey_config,
+                                &hotkey_display,
+                                hotkey_configurable,
                                 &mut self.auto_action,
                                 &mut self.pinned,
                                 &mut should_apply_hotkey,
@@ -539,6 +796,7 @@ impl eframe::App for SpeechApp {
             }
             if should_apply_hotkey {
                 self.apply_hotkey();
+                self.save_current_settings();
             }
             if self.pinned != was_pinned {
                 let level = if self.pinned {
@@ -547,6 +805,10 @@ impl eframe::App for SpeechApp {
                     egui::WindowLevel::Normal
                 };
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                self.save_current_settings();
+            }
+            if self.auto_action != was_auto_action {
+                self.save_current_settings();
             }
         }
 
@@ -562,7 +824,10 @@ impl eframe::App for SpeechApp {
                 let tooltip = if self.recording {
                     "Stop recording".to_owned()
                 } else {
-                    format!("Record ({})", self.hotkey_config.display())
+                    format!(
+                        "Record ({})",
+                        self.hotkey_backend.hotkey_display(&self.hotkey_config)
+                    )
                 };
                 if ui
                     .add_enabled(
@@ -617,6 +882,7 @@ impl eframe::App for SpeechApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_current_settings();
         let _ = self.worker_tx.send(InferenceCommand::Shutdown);
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
@@ -631,6 +897,8 @@ impl SpeechApp {
         ui: &mut egui::Ui,
         pending: &mut HotkeyConfig,
         current: &HotkeyConfig,
+        hotkey_display: &str,
+        hotkey_configurable: bool,
         auto_action: &mut AutoAction,
         pinned: &mut bool,
         apply_clicked: &mut bool,
@@ -639,45 +907,60 @@ impl SpeechApp {
         ui.label("Global keyboard shortcut to start/stop recording.");
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            if cfg!(target_os = "macos") {
-                ui.checkbox(&mut pending.use_super, "Cmd");
-            } else {
-                ui.checkbox(&mut pending.use_super, "Super");
-            }
-            ui.checkbox(&mut pending.use_ctrl, "Ctrl");
-            ui.checkbox(&mut pending.use_shift, "Shift");
-            if cfg!(target_os = "macos") {
-                ui.checkbox(&mut pending.use_alt, "Option");
-            } else {
-                ui.checkbox(&mut pending.use_alt, "Alt");
-            }
-        });
+        if hotkey_configurable {
+            ui.horizontal(|ui| {
+                if cfg!(target_os = "macos") {
+                    ui.checkbox(&mut pending.use_super, "Cmd");
+                } else {
+                    ui.checkbox(&mut pending.use_super, "Super");
+                }
+                ui.checkbox(&mut pending.use_ctrl, "Ctrl");
+                ui.checkbox(&mut pending.use_shift, "Shift");
+                if cfg!(target_os = "macos") {
+                    ui.checkbox(&mut pending.use_alt, "Option");
+                } else {
+                    ui.checkbox(&mut pending.use_alt, "Alt");
+                }
+            });
 
-        ui.horizontal(|ui| {
-            ui.label("Key:");
-            egui::ComboBox::from_id_salt("hotkey_key")
-                .width(55.0)
-                .selected_text(KEY_OPTIONS[pending.key_idx].0)
-                .show_ui(ui, |ui| {
-                    for (i, (name, _)) in KEY_OPTIONS.iter().enumerate() {
-                        ui.selectable_value(&mut pending.key_idx, i, *name);
-                    }
-                });
-        });
+            ui.horizontal(|ui| {
+                ui.label("Key:");
+                egui::ComboBox::from_id_salt("hotkey_key")
+                    .width(55.0)
+                    .selected_text(KEY_OPTIONS[pending.key_idx].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _)) in KEY_OPTIONS.iter().enumerate() {
+                            ui.selectable_value(&mut pending.key_idx, i, *name);
+                        }
+                    });
+            });
 
-        ui.add_space(4.0);
+            ui.add_space(4.0);
 
-        let pending_display = pending.display();
-        let current_display = current.display();
-        let changed = pending_display != current_display;
+            let pending_display = pending.display();
+            let current_display = current.display();
+            let changed = pending_display != current_display;
 
-        ui.horizontal(|ui| {
-            ui.label(format!("Current: {current_display}"));
-            if changed && ui.button("Apply").clicked() {
-                *apply_clicked = true;
-            }
-        });
+            ui.horizontal(|ui| {
+                ui.label(format!("Current: {current_display}"));
+                if changed && ui.button("Apply").clicked() {
+                    *apply_clicked = true;
+                }
+            });
+        } else {
+            // Wayland portal — hotkey is managed by the compositor
+            ui.label(format!("Current: {hotkey_display}"));
+            ui.indent("wayland_note", |ui| {
+                ui.label(
+                    RichText::new(
+                        "Hotkey is managed by the desktop environment via \
+                         xdg-desktop-portal. Change it in your compositor settings.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        }
 
         ui.add_space(8.0);
         ui.separator();
