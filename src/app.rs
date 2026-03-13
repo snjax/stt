@@ -57,54 +57,13 @@ impl AutoAction {
 
 // ── Hotkey config ───────────────────────────────────────────────────
 
-const KEY_OPTIONS: &[(&str, Code)] = &[
-    ("A", Code::KeyA),
-    ("B", Code::KeyB),
-    ("C", Code::KeyC),
-    ("D", Code::KeyD),
-    ("E", Code::KeyE),
-    ("F", Code::KeyF),
-    ("G", Code::KeyG),
-    ("H", Code::KeyH),
-    ("I", Code::KeyI),
-    ("J", Code::KeyJ),
-    ("K", Code::KeyK),
-    ("L", Code::KeyL),
-    ("M", Code::KeyM),
-    ("N", Code::KeyN),
-    ("O", Code::KeyO),
-    ("P", Code::KeyP),
-    ("Q", Code::KeyQ),
-    ("R", Code::KeyR),
-    ("S", Code::KeyS),
-    ("T", Code::KeyT),
-    ("U", Code::KeyU),
-    ("V", Code::KeyV),
-    ("W", Code::KeyW),
-    ("X", Code::KeyX),
-    ("Y", Code::KeyY),
-    ("Z", Code::KeyZ),
-    ("F1", Code::F1),
-    ("F2", Code::F2),
-    ("F3", Code::F3),
-    ("F4", Code::F4),
-    ("F5", Code::F5),
-    ("F6", Code::F6),
-    ("F7", Code::F7),
-    ("F8", Code::F8),
-    ("F9", Code::F9),
-    ("F10", Code::F10),
-    ("F11", Code::F11),
-    ("F12", Code::F12),
-];
-
 #[derive(Clone, Serialize, Deserialize)]
 struct HotkeyConfig {
     use_super: bool,
     use_ctrl: bool,
     use_shift: bool,
     use_alt: bool,
-    key_idx: usize,
+    key_name: String,
 }
 
 impl HotkeyConfig {
@@ -114,11 +73,12 @@ impl HotkeyConfig {
             use_ctrl: false,
             use_shift: true,
             use_alt: false,
-            key_idx: 17, // R
+            key_name: "R".into(),
         }
     }
 
-    fn to_hotkey(&self) -> HotKey {
+    fn to_hotkey(&self) -> Option<HotKey> {
+        let code = key_name_to_code(&self.key_name)?;
         let mut mods = Modifiers::empty();
         if self.use_super {
             mods |= Modifiers::SUPER;
@@ -133,7 +93,7 @@ impl HotkeyConfig {
             mods |= Modifiers::ALT;
         }
         let modifiers = if mods.is_empty() { None } else { Some(mods) };
-        HotKey::new(modifiers, KEY_OPTIONS[self.key_idx].1)
+        Some(HotKey::new(modifiers, code))
     }
 
     fn display(&self) -> String {
@@ -158,11 +118,10 @@ impl HotkeyConfig {
         if self.use_shift {
             parts.push("Shift");
         }
-        parts.push(KEY_OPTIONS[self.key_idx].0);
+        parts.push(&self.key_name);
         parts.join("+")
     }
 
-    /// Convert to XDG portal trigger format (GTK accelerator syntax).
     #[cfg(target_os = "linux")]
     fn to_portal_trigger(&self) -> String {
         let mut trigger = String::new();
@@ -178,9 +137,187 @@ impl HotkeyConfig {
         if self.use_shift {
             trigger.push_str("<Shift>");
         }
-        trigger.push_str(KEY_OPTIONS[self.key_idx].0);
+        trigger.push_str(&self.key_name);
         trigger
     }
+}
+
+/// Map key name to global-hotkey Code for X11/macOS backend.
+fn key_name_to_code(name: &str) -> Option<Code> {
+    Some(match name {
+        "A" => Code::KeyA,
+        "B" => Code::KeyB,
+        "C" => Code::KeyC,
+        "D" => Code::KeyD,
+        "E" => Code::KeyE,
+        "F" => Code::KeyF,
+        "G" => Code::KeyG,
+        "H" => Code::KeyH,
+        "I" => Code::KeyI,
+        "J" => Code::KeyJ,
+        "K" => Code::KeyK,
+        "L" => Code::KeyL,
+        "M" => Code::KeyM,
+        "N" => Code::KeyN,
+        "O" => Code::KeyO,
+        "P" => Code::KeyP,
+        "Q" => Code::KeyQ,
+        "R" => Code::KeyR,
+        "S" => Code::KeyS,
+        "T" => Code::KeyT,
+        "U" => Code::KeyU,
+        "V" => Code::KeyV,
+        "W" => Code::KeyW,
+        "X" => Code::KeyX,
+        "Y" => Code::KeyY,
+        "Z" => Code::KeyZ,
+        "1" => Code::Digit1,
+        "2" => Code::Digit2,
+        "3" => Code::Digit3,
+        "4" => Code::Digit4,
+        "5" => Code::Digit5,
+        "6" => Code::Digit6,
+        "7" => Code::Digit7,
+        "8" => Code::Digit8,
+        "9" => Code::Digit9,
+        "0" => Code::Digit0,
+        "F1" => Code::F1,
+        "F2" => Code::F2,
+        "F3" => Code::F3,
+        "F4" => Code::F4,
+        "F5" => Code::F5,
+        "F6" => Code::F6,
+        "F7" => Code::F7,
+        "F8" => Code::F8,
+        "F9" => Code::F9,
+        "F10" => Code::F10,
+        "F11" => Code::F11,
+        "F12" => Code::F12,
+        "Space" => Code::Space,
+        "Enter" => Code::Enter,
+        "Tab" => Code::Tab,
+        "Escape" => Code::Escape,
+        "Backspace" => Code::Backspace,
+        "Up" => Code::ArrowUp,
+        "Down" => Code::ArrowDown,
+        "Left" => Code::ArrowLeft,
+        "Right" => Code::ArrowRight,
+        "Home" => Code::Home,
+        "End" => Code::End,
+        "PageUp" => Code::PageUp,
+        "PageDown" => Code::PageDown,
+        "Insert" => Code::Insert,
+        "Delete" => Code::Delete,
+        "Minus" => Code::Minus,
+        "Equal" => Code::Equal,
+        "LeftBracket" => Code::BracketLeft,
+        "RightBracket" => Code::BracketRight,
+        "Backslash" => Code::Backslash,
+        "Semicolon" => Code::Semicolon,
+        "Apostrophe" => Code::Quote,
+        "Grave" => Code::Backquote,
+        "Comma" => Code::Comma,
+        "Dot" => Code::Period,
+        "Slash" => Code::Slash,
+        "CapsLock" => Code::CapsLock,
+        "Num0" => Code::Numpad0,
+        "Num1" => Code::Numpad1,
+        "Num2" => Code::Numpad2,
+        "Num3" => Code::Numpad3,
+        "Num4" => Code::Numpad4,
+        "Num5" => Code::Numpad5,
+        "Num6" => Code::Numpad6,
+        "Num7" => Code::Numpad7,
+        "Num8" => Code::Numpad8,
+        "Num9" => Code::Numpad9,
+        "NumEnter" => Code::NumpadEnter,
+        "NumPlus" => Code::NumpadAdd,
+        "NumMinus" => Code::NumpadSubtract,
+        "NumMultiply" => Code::NumpadMultiply,
+        "NumDivide" => Code::NumpadDivide,
+        "NumDot" => Code::NumpadDecimal,
+        _ => return None,
+    })
+}
+
+/// Map egui::Key to our key_name format.
+fn egui_key_to_name(key: egui::Key) -> Option<&'static str> {
+    Some(match key {
+        egui::Key::A => "A",
+        egui::Key::B => "B",
+        egui::Key::C => "C",
+        egui::Key::D => "D",
+        egui::Key::E => "E",
+        egui::Key::F => "F",
+        egui::Key::G => "G",
+        egui::Key::H => "H",
+        egui::Key::I => "I",
+        egui::Key::J => "J",
+        egui::Key::K => "K",
+        egui::Key::L => "L",
+        egui::Key::M => "M",
+        egui::Key::N => "N",
+        egui::Key::O => "O",
+        egui::Key::P => "P",
+        egui::Key::Q => "Q",
+        egui::Key::R => "R",
+        egui::Key::S => "S",
+        egui::Key::T => "T",
+        egui::Key::U => "U",
+        egui::Key::V => "V",
+        egui::Key::W => "W",
+        egui::Key::X => "X",
+        egui::Key::Y => "Y",
+        egui::Key::Z => "Z",
+        egui::Key::Num0 => "0",
+        egui::Key::Num1 => "1",
+        egui::Key::Num2 => "2",
+        egui::Key::Num3 => "3",
+        egui::Key::Num4 => "4",
+        egui::Key::Num5 => "5",
+        egui::Key::Num6 => "6",
+        egui::Key::Num7 => "7",
+        egui::Key::Num8 => "8",
+        egui::Key::Num9 => "9",
+        egui::Key::F1 => "F1",
+        egui::Key::F2 => "F2",
+        egui::Key::F3 => "F3",
+        egui::Key::F4 => "F4",
+        egui::Key::F5 => "F5",
+        egui::Key::F6 => "F6",
+        egui::Key::F7 => "F7",
+        egui::Key::F8 => "F8",
+        egui::Key::F9 => "F9",
+        egui::Key::F10 => "F10",
+        egui::Key::F11 => "F11",
+        egui::Key::F12 => "F12",
+        egui::Key::F13 => "F13",
+        egui::Key::F14 => "F14",
+        egui::Key::F15 => "F15",
+        egui::Key::F16 => "F16",
+        egui::Key::F17 => "F17",
+        egui::Key::F18 => "F18",
+        egui::Key::F19 => "F19",
+        egui::Key::F20 => "F20",
+        egui::Key::ArrowUp => "Up",
+        egui::Key::ArrowDown => "Down",
+        egui::Key::ArrowLeft => "Left",
+        egui::Key::ArrowRight => "Right",
+        egui::Key::Home => "Home",
+        egui::Key::End => "End",
+        egui::Key::PageUp => "PageUp",
+        egui::Key::PageDown => "PageDown",
+        egui::Key::Insert => "Insert",
+        egui::Key::Delete => "Delete",
+        egui::Key::Space => "Space",
+        egui::Key::Enter => "Enter",
+        egui::Key::Tab => "Tab",
+        egui::Key::Escape => "Escape",
+        egui::Key::Backspace => "Backspace",
+        egui::Key::Minus => "Minus",
+        egui::Key::Plus => "Equal",
+        _ => return None,
+    })
 }
 
 // ── Hotkey backend ──────────────────────────────────────────────────
@@ -225,11 +362,22 @@ impl HotkeyBackend {
 fn setup_global_hotkey(config: &HotkeyConfig) -> Result<HotkeyBackend> {
     let manager = GlobalHotKeyManager::new()
         .map_err(|e| anyhow::anyhow!("failed to create hotkey manager: {e}"))?;
-    let hotkey = config.to_hotkey();
+    let hotkey = config
+        .to_hotkey()
+        .ok_or_else(|| anyhow::anyhow!("key '{}' is not supported by X11/macOS backend", config.key_name))?;
     manager
         .register(hotkey)
         .map_err(|e| anyhow::anyhow!("failed to register hotkey: {e}"))?;
     Ok(HotkeyBackend::GlobalHotkey { manager, hotkey })
+}
+
+// ── Learn mode ──────────────────────────────────────────────────────
+
+enum LearnState {
+    Idle,
+    #[cfg(target_os = "linux")]
+    Evdev(crate::evdev_hotkey::EvdevKeyLearner),
+    Egui,
 }
 
 // ── Worker protocol ─────────────────────────────────────────────────
@@ -275,19 +423,10 @@ fn load_settings() -> Settings {
     let Ok(data) = fs::read_to_string(&path) else {
         return Settings::default();
     };
-    match serde_json::from_str::<Settings>(&data) {
-        Ok(mut s) => {
-            // Clamp key_idx to valid range
-            if s.hotkey.key_idx >= KEY_OPTIONS.len() {
-                s.hotkey.key_idx = HotkeyConfig::default_config().key_idx;
-            }
-            s
-        }
-        Err(e) => {
-            eprintln!("Failed to parse settings: {e}");
-            Settings::default()
-        }
-    }
+    serde_json::from_str::<Settings>(&data).unwrap_or_else(|e| {
+        eprintln!("Failed to parse settings: {e}");
+        Settings::default()
+    })
 }
 
 fn save_settings(settings: &Settings) {
@@ -343,10 +482,9 @@ fn create_hotkey_backend(config: &HotkeyConfig) -> Result<HotkeyBackend> {
     #[cfg(target_os = "linux")]
     {
         let is_wayland = std::env::var("WAYLAND_DISPLAY")
-            .map_or(false, |v| !v.is_empty());
+            .is_ok_and(|v| !v.is_empty());
 
         if is_wayland {
-            // Try xdg-desktop-portal GlobalShortcuts first
             let trigger = config.to_portal_trigger();
             match crate::wayland_hotkey::WaylandHotkeyListener::new(&trigger) {
                 Ok(listener) => {
@@ -361,10 +499,8 @@ fn create_hotkey_backend(config: &HotkeyConfig) -> Result<HotkeyBackend> {
                 }
             }
 
-            // Fall back to evdev (reads /dev/input directly)
-            let key_name = KEY_OPTIONS[config.key_idx].0;
             match crate::evdev_hotkey::EvdevHotkeyListener::new(
-                key_name,
+                &config.key_name,
                 config.use_super,
                 config.use_ctrl,
                 config.use_shift,
@@ -400,10 +536,10 @@ pub struct SpeechApp {
     pinned: bool,
     auto_action: AutoAction,
     hotkey_config: HotkeyConfig,
-    pending_hotkey: HotkeyConfig,
 
     // Hotkey management
     hotkey_backend: HotkeyBackend,
+    learn_state: LearnState,
 
     // Paste target tracking
     paste_target_window: Option<String>,
@@ -427,7 +563,7 @@ impl SpeechApp {
 
         #[cfg(target_os = "linux")]
         let wayland_paster = if std::env::var("WAYLAND_DISPLAY")
-            .map_or(false, |v| !v.is_empty())
+            .is_ok_and(|v| !v.is_empty())
         {
             match crate::wayland_paste::WaylandPaster::new() {
                 Ok(p) => Some(p),
@@ -440,7 +576,6 @@ impl SpeechApp {
             None
         };
 
-        let pending = settings.hotkey.clone();
         Self {
             recorder: AudioRecorder::default(),
             worker_tx,
@@ -454,9 +589,9 @@ impl SpeechApp {
             pinned: settings.pinned,
             auto_action: settings.auto_action,
             hotkey_config: settings.hotkey,
-            pending_hotkey: pending,
 
             hotkey_backend,
+            learn_state: LearnState::Idle,
 
             paste_target_window: None,
             title_warning: None,
@@ -532,7 +667,6 @@ impl SpeechApp {
         #[cfg(target_os = "linux")]
         {
             crate::paste::simulate_paste(self.wayland_paster.as_ref());
-            return;
         }
 
         #[cfg(target_os = "macos")]
@@ -550,7 +684,7 @@ impl SpeechApp {
                 let current_window = get_active_window();
                 let window_matches = match (&self.paste_target_window, &current_window) {
                     (Some(target), Some(current)) => target == current,
-                    (None, None) => true, // detection unavailable → trust the user
+                    (None, None) => true,
                     _ => false,
                 };
 
@@ -568,7 +702,7 @@ impl SpeechApp {
                 self.do_paste();
                 if let Some(old) = old_clipboard {
                     thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(200));
+                        thread::sleep(Duration::from_millis(500));
                         clipboard_copy(&old);
                     });
                 }
@@ -585,6 +719,7 @@ impl SpeechApp {
                     self.transcribing = false;
                     match result {
                         Ok(text) => {
+                            eprintln!("[app] Finished: {} chars", text.len());
                             self.transcription = text;
                             self.partial_text.clear();
                             self.handle_auto_action();
@@ -595,6 +730,7 @@ impl SpeechApp {
                     }
                 }
                 Ok(InferenceEvent::PartialResult(text)) => {
+                    eprintln!("[app] Partial: {} chars", text.len());
                     self.partial_text = text;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -636,52 +772,55 @@ impl SpeechApp {
 
     // ── Hotkey management ───────────────────────────────────────────
 
-    fn apply_hotkey(&mut self) {
+    fn apply_learned_hotkey(&mut self, new_config: HotkeyConfig) -> bool {
         match &mut self.hotkey_backend {
             HotkeyBackend::GlobalHotkey { manager, hotkey } => {
-                let new_hotkey = self.pending_hotkey.to_hotkey();
-                if new_hotkey.id() == hotkey.id() {
-                    return;
-                }
-
+                let Some(new_hotkey) = new_config.to_hotkey() else {
+                    self.title_warning = Some((
+                        format!("Key '{}' not supported on this backend", new_config.key_name),
+                        Instant::now(),
+                    ));
+                    return false;
+                };
                 if let Err(e) = manager.unregister(*hotkey) {
                     eprintln!("Failed to unregister old hotkey: {e}");
                 }
                 match manager.register(new_hotkey) {
                     Ok(()) => {
                         *hotkey = new_hotkey;
-                        self.hotkey_config = self.pending_hotkey.clone();
+                        self.hotkey_config = new_config;
                     }
                     Err(e) => {
                         eprintln!("Failed to register new hotkey: {e}, restoring old");
                         let _ = manager.register(*hotkey);
-                        self.pending_hotkey = self.hotkey_config.clone();
+                        return false;
                     }
                 }
             }
             #[cfg(target_os = "linux")]
             HotkeyBackend::Evdev { listener } => {
-                let key_name = KEY_OPTIONS[self.pending_hotkey.key_idx].0;
                 match crate::evdev_hotkey::EvdevHotkeyListener::new(
-                    key_name,
-                    self.pending_hotkey.use_super,
-                    self.pending_hotkey.use_ctrl,
-                    self.pending_hotkey.use_shift,
-                    self.pending_hotkey.use_alt,
+                    &new_config.key_name,
+                    new_config.use_super,
+                    new_config.use_ctrl,
+                    new_config.use_shift,
+                    new_config.use_alt,
                 ) {
                     Ok(new_listener) => {
                         *listener = new_listener;
-                        self.hotkey_config = self.pending_hotkey.clone();
+                        self.hotkey_config = new_config;
                     }
                     Err(e) => {
                         eprintln!("Failed to apply evdev hotkey: {e}");
-                        self.pending_hotkey = self.hotkey_config.clone();
+                        return false;
                     }
                 }
             }
             #[cfg(target_os = "linux")]
-            HotkeyBackend::Portal { .. } => {} // managed by compositor
+            HotkeyBackend::Portal { .. } => return false,
         }
+        self.save_current_settings();
+        true
     }
 
     fn save_current_settings(&self) {
@@ -734,10 +873,10 @@ impl eframe::App for SpeechApp {
         if self.show_settings {
             let was_pinned = self.pinned;
             let was_auto_action = self.auto_action;
-            let mut should_apply_hotkey = false;
             let mut should_close = false;
             let hotkey_configurable = self.hotkey_backend.is_configurable();
             let hotkey_display = self.hotkey_backend.hotkey_display(&self.hotkey_config);
+            let mut learned_config: Option<HotkeyConfig> = None;
 
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("stt_settings"),
@@ -750,8 +889,6 @@ impl eframe::App for SpeechApp {
                         should_close = true;
                     }
 
-                    // If embedded (backend doesn't support multi-viewport),
-                    // wrap in an egui::Window
                     if class == ViewportClass::Embedded {
                         let mut open = true;
                         egui::Window::new("\u{2699}\u{FE0F} Settings")
@@ -762,13 +899,12 @@ impl eframe::App for SpeechApp {
                             .show(inner_ctx, |ui| {
                                 Self::draw_settings_ui(
                                     ui,
-                                    &mut self.pending_hotkey,
-                                    &self.hotkey_config,
                                     &hotkey_display,
                                     hotkey_configurable,
+                                    &mut self.learn_state,
+                                    &mut learned_config,
                                     &mut self.auto_action,
                                     &mut self.pinned,
-                                    &mut should_apply_hotkey,
                                 );
                             });
                         if !open {
@@ -778,13 +914,12 @@ impl eframe::App for SpeechApp {
                         egui::CentralPanel::default().show(inner_ctx, |ui| {
                             Self::draw_settings_ui(
                                 ui,
-                                &mut self.pending_hotkey,
-                                &self.hotkey_config,
                                 &hotkey_display,
                                 hotkey_configurable,
+                                &mut self.learn_state,
+                                &mut learned_config,
                                 &mut self.auto_action,
                                 &mut self.pinned,
-                                &mut should_apply_hotkey,
                             );
                         });
                     }
@@ -793,10 +928,11 @@ impl eframe::App for SpeechApp {
 
             if should_close {
                 self.show_settings = false;
+                self.learn_state = LearnState::Idle;
             }
-            if should_apply_hotkey {
-                self.apply_hotkey();
-                self.save_current_settings();
+            if let Some(config) = learned_config {
+                self.apply_learned_hotkey(config);
+                self.learn_state = LearnState::Idle;
             }
             if self.pinned != was_pinned {
                 let level = if self.pinned {
@@ -815,7 +951,6 @@ impl eframe::App for SpeechApp {
         // ── Main panel ──────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Record / Stop
                 let icon = if self.recording {
                     "\u{23F9}"
                 } else {
@@ -844,7 +979,6 @@ impl eframe::App for SpeechApp {
                     }
                 }
 
-                // Copy
                 if ui
                     .add(egui::Button::new(RichText::new("\u{1F4CB}").size(18.0)))
                     .on_hover_text("Copy to clipboard")
@@ -853,7 +987,6 @@ impl eframe::App for SpeechApp {
                     self.copy_to_clipboard();
                 }
 
-                // Settings
                 if ui
                     .add(egui::Button::new(RichText::new("\u{2699}").size(18.0)))
                     .on_hover_text("Settings")
@@ -863,19 +996,34 @@ impl eframe::App for SpeechApp {
                 }
             });
 
-            // Textarea — fills all remaining space
-            let text = if self.recording && !self.partial_text.is_empty() {
-                &self.partial_text
-            } else {
-                &self.transcription
-            };
-            let mut display = text.to_owned();
             let available = ui.available_size();
-            ui.add_sized(
-                available,
-                egui::TextEdit::multiline(&mut display).desired_width(f32::INFINITY),
-            );
-            if !self.recording {
+            if self.recording || self.transcribing {
+                // During recording/transcribing: show partial preview as a read-only label
+                egui::ScrollArea::vertical()
+                    .max_height(available.y)
+                    .show(ui, |ui| {
+                        if self.partial_text.is_empty() {
+                            let status = if self.recording {
+                                "Recording..."
+                            } else {
+                                "Transcribing..."
+                            };
+                            ui.label(RichText::new(status).weak().italics());
+                        } else {
+                            ui.label(
+                                RichText::new(&self.partial_text)
+                                    .weak()
+                                    .italics(),
+                            );
+                        }
+                    });
+            } else {
+                // After finalization: editable textarea with full text
+                let mut display = self.transcription.clone();
+                ui.add_sized(
+                    available,
+                    egui::TextEdit::multiline(&mut display).desired_width(f32::INFINITY),
+                );
                 self.transcription = display;
             }
         });
@@ -890,66 +1038,119 @@ impl eframe::App for SpeechApp {
     }
 }
 
-// ── Settings UI (shared between viewport and embedded fallback) ─────
+// ── Settings UI ─────────────────────────────────────────────────────
 
 impl SpeechApp {
     fn draw_settings_ui(
         ui: &mut egui::Ui,
-        pending: &mut HotkeyConfig,
-        current: &HotkeyConfig,
         hotkey_display: &str,
         hotkey_configurable: bool,
+        learn_state: &mut LearnState,
+        learned_config: &mut Option<HotkeyConfig>,
         auto_action: &mut AutoAction,
         pinned: &mut bool,
-        apply_clicked: &mut bool,
     ) {
         ui.heading("Hotkey");
         ui.label("Global keyboard shortcut to start/stop recording.");
         ui.add_space(4.0);
 
+        ui.label(format!("Current: {hotkey_display}"));
+        ui.add_space(4.0);
+
         if hotkey_configurable {
-            ui.horizontal(|ui| {
-                if cfg!(target_os = "macos") {
-                    ui.checkbox(&mut pending.use_super, "Cmd");
-                } else {
-                    ui.checkbox(&mut pending.use_super, "Super");
-                }
-                ui.checkbox(&mut pending.use_ctrl, "Ctrl");
-                ui.checkbox(&mut pending.use_shift, "Shift");
-                if cfg!(target_os = "macos") {
-                    ui.checkbox(&mut pending.use_alt, "Option");
-                } else {
-                    ui.checkbox(&mut pending.use_alt, "Alt");
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Key:");
-                egui::ComboBox::from_id_salt("hotkey_key")
-                    .width(55.0)
-                    .selected_text(KEY_OPTIONS[pending.key_idx].0)
-                    .show_ui(ui, |ui| {
-                        for (i, (name, _)) in KEY_OPTIONS.iter().enumerate() {
-                            ui.selectable_value(&mut pending.key_idx, i, *name);
+            match learn_state {
+                LearnState::Idle => {
+                    if ui.button("Change hotkey...").clicked() {
+                        #[cfg(target_os = "linux")]
+                        if matches_evdev_backend() {
+                            match crate::evdev_hotkey::EvdevKeyLearner::start() {
+                                Ok(learner) => {
+                                    *learn_state = LearnState::Evdev(learner);
+                                    return;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to start evdev learner: {e}");
+                                }
+                            }
                         }
-                    });
-            });
-
-            ui.add_space(4.0);
-
-            let pending_display = pending.display();
-            let current_display = current.display();
-            let changed = pending_display != current_display;
-
-            ui.horizontal(|ui| {
-                ui.label(format!("Current: {current_display}"));
-                if changed && ui.button("Apply").clicked() {
-                    *apply_clicked = true;
+                        *learn_state = LearnState::Egui;
+                    }
                 }
-            });
+                #[cfg(target_os = "linux")]
+                LearnState::Evdev(learner) => {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Press your hotkey combination...")
+                            .strong()
+                            .color(egui::Color32::YELLOW),
+                    );
+                    ui.label(
+                        RichText::new("Hold modifiers, then press the trigger key.")
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    if ui.button("Cancel").clicked() {
+                        *learn_state = LearnState::Idle;
+                        return;
+                    }
+
+                    if let Some(key) = learner.try_recv() {
+                        *learned_config = Some(HotkeyConfig {
+                            use_super: key.super_key,
+                            use_ctrl: key.ctrl,
+                            use_shift: key.shift,
+                            use_alt: key.alt,
+                            key_name: key.key_name,
+                        });
+                    } else {
+                        // Keep polling
+                        ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    }
+                }
+                LearnState::Egui => {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Press your hotkey combination...")
+                            .strong()
+                            .color(egui::Color32::YELLOW),
+                    );
+                    ui.label(
+                        RichText::new("Hold modifiers, then press the trigger key.")
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    if ui.button("Cancel").clicked() {
+                        *learn_state = LearnState::Idle;
+                        return;
+                    }
+
+                    // Capture key from egui events
+                    let events = ui.input(|i| i.events.clone());
+                    for event in &events {
+                        if let egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                            && let Some(name) = egui_key_to_name(*key) {
+                                *learned_config = Some(HotkeyConfig {
+                                    use_super: modifiers.mac_cmd || modifiers.command,
+                                    use_ctrl: modifiers.ctrl,
+                                    use_shift: modifiers.shift,
+                                    use_alt: modifiers.alt,
+                                    key_name: name.into(),
+                                });
+                                break;
+                            }
+                    }
+
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                }
+            }
         } else {
-            // Wayland portal — hotkey is managed by the compositor
-            ui.label(format!("Current: {hotkey_display}"));
             ui.indent("wayland_note", |ui| {
                 ui.label(
                     RichText::new(
@@ -966,7 +1167,6 @@ impl SpeechApp {
         ui.separator();
         ui.add_space(4.0);
 
-        // ── After transcription ─────────────────────────────────
         ui.heading("After transcription");
         ui.add_space(4.0);
 
@@ -983,7 +1183,6 @@ impl SpeechApp {
         ui.separator();
         ui.add_space(4.0);
 
-        // ── Window ──────────────────────────────────────────────
         ui.heading("Window");
         ui.add_space(4.0);
 
@@ -996,6 +1195,14 @@ impl SpeechApp {
             );
         });
     }
+}
+
+/// Helper to check if the current backend is evdev (to decide learn mode).
+#[cfg(target_os = "linux")]
+fn matches_evdev_backend() -> bool {
+    // If WAYLAND_DISPLAY is set, evdev is likely the backend
+    // (portal doesn't allow configuring, global-hotkey is X11 fallback)
+    std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty())
 }
 
 // ── Inference worker ────────────────────────────────────────────────

@@ -1,15 +1,3 @@
-mod app;
-mod audio;
-#[cfg(target_os = "linux")]
-mod evdev_hotkey;
-mod paste;
-mod streaming;
-#[cfg(target_os = "linux")]
-mod wayland_hotkey;
-#[cfg(target_os = "linux")]
-mod wayland_paste;
-mod whisper_cpp;
-
 use std::{
     env,
     path::{Path, PathBuf},
@@ -18,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::{
+use stt::{
     app::run_gui,
     whisper_cpp::WhisperCppTranscriber,
 };

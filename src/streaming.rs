@@ -5,8 +5,6 @@ use anyhow::Result;
 use crate::whisper_cpp::WhisperCppTranscriber;
 
 const SAMPLE_RATE: usize = 16_000;
-/// Sliding window size in seconds for streaming inference
-const WINDOW_SECONDS: usize = 10;
 /// Minimum interval between streaming inference calls
 const MIN_CHUNK_INTERVAL: Duration = Duration::from_secs(5);
 /// Minimum audio length to trigger inference (1 second)
@@ -35,7 +33,7 @@ impl StreamingEngine {
     }
 
     /// Push new audio samples and optionally get a partial transcription.
-    /// Returns Some(text) if enough time has passed and inference was run.
+    /// Runs full-buffer inference to produce accumulated text (not just last window).
     pub fn push_samples(&mut self, new_samples: &[f32]) -> Option<String> {
         self.audio_buffer.extend_from_slice(new_samples);
 
@@ -51,14 +49,11 @@ impl StreamingEngine {
             return None;
         }
 
-        // Sliding window: take last WINDOW_SECONDS of audio
-        let window_samples = SAMPLE_RATE * WINDOW_SECONDS;
-        let start = self.audio_buffer.len().saturating_sub(window_samples);
-        let window = &self.audio_buffer[start..];
-
         self.last_inference = Some(Instant::now());
 
-        match self.transcriber.transcribe_samples_streaming(window, true) {
+        // Run inference on the FULL accumulated buffer so partial_text
+        // contains everything transcribed so far, not just the last window.
+        match self.transcriber.transcribe_samples(&self.audio_buffer) {
             Ok(text) => {
                 self.partial_text = text.clone();
                 Some(text)
@@ -72,22 +67,24 @@ impl StreamingEngine {
 
     /// Finalize: run inference on the full audio buffer for best quality.
     pub fn finalize(&mut self) -> Result<String> {
-        eprintln!("[finalize] audio_buffer len: {} ({:.1}s)", self.audio_buffer.len(), self.audio_buffer.len() as f64 / SAMPLE_RATE as f64);
+        eprintln!(
+            "[finalize] audio_buffer len: {} ({:.1}s)",
+            self.audio_buffer.len(),
+            self.audio_buffer.len() as f64 / SAMPLE_RATE as f64
+        );
         if self.audio_buffer.is_empty() {
             eprintln!("[finalize] buffer empty, returning empty string");
             return Ok(String::new());
         }
 
-        // Pass full buffer to whisper_full — it handles chunking internally
-        // with context carry-over between 30s segments
-        let samples = self.transcriber.transcribe_samples(&self.audio_buffer);
+        let result = self.transcriber.transcribe_samples(&self.audio_buffer);
 
         // Reset state for next recording
         self.audio_buffer.clear();
         self.partial_text.clear();
         self.last_inference = None;
 
-        samples
+        result
     }
 
     /// Reset the engine, discarding all buffered audio.

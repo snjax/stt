@@ -240,15 +240,19 @@ impl WhisperCppTranscriber {
 
         let lang = CString::new("auto").unwrap();
         params.language = lang.as_ptr();
-        params.no_context = false;
+        params.no_context = true; // clear stale decoder state from previous calls; intra-call context still carries between segments
         params.single_segment = false;
         params.print_special = false;
         params.print_progress = false;
         params.print_realtime = false;
         params.print_timestamps = false;
+        params.suppress_blank = true;
+        params.suppress_nst = true; // suppress non-speech tokens
+        params.no_speech_thold = 0.6;
+        params.entropy_thold = 2.4; // skip low-confidence / repetitive segments
         params.n_threads = num_cpus().min(8) as i32;
 
-        // Two-pass: detect language first, restrict to ru/en
+        // Detect language first, restrict to ru/en
         let detected = self.detect_language(samples)?;
         let forced_lang = if detected == "ru" { "ru" } else { "en" };
         let forced = CString::new(forced_lang).unwrap();
@@ -264,7 +268,8 @@ impl WhisperCppTranscriber {
         }
 
         let n_segments = unsafe { whisper_full_n_segments(self.ctx) };
-        let mut text = String::new();
+        eprintln!("[transcribe] samples={} ({:.1}s), segments={}", samples.len(), samples.len() as f64 / 16000.0, n_segments);
+        let mut segments: Vec<String> = Vec::new();
         for i in 0..n_segments {
             let segment_text = unsafe {
                 let ptr = whisper_full_get_segment_text(self.ctx, i);
@@ -275,12 +280,18 @@ impl WhisperCppTranscriber {
                     .to_str()
                     .unwrap_or("")
             };
-            text.push_str(segment_text);
+            let trimmed = segment_text.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed.to_owned());
+            }
         }
 
-        Ok(text.trim().to_owned())
+        let result = merge_segments_edge_dedup(&segments);
+        eprintln!("[transcribe] result: {} chars", result.len());
+        Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn transcribe_samples_streaming(
         &self,
         samples: &[f32],
@@ -302,9 +313,13 @@ impl WhisperCppTranscriber {
         params.print_progress = false;
         params.print_realtime = false;
         params.print_timestamps = false;
+        params.suppress_blank = true;
+        params.suppress_nst = true;
+        params.no_speech_thold = 0.6;
+        params.entropy_thold = 2.4;
         params.n_threads = num_cpus().min(8) as i32;
 
-        // Two-pass: detect language first, restrict to ru/en
+        // Detect language first, restrict to ru/en
         let detected = self.detect_language(samples)?;
         let forced_lang = if detected == "ru" { "ru" } else { "en" };
         let forced = CString::new(forced_lang).unwrap();
@@ -400,6 +415,37 @@ impl Drop for WhisperCppTranscriber {
             self.ctx = ptr::null_mut();
         }
     }
+}
+
+/// Merge segments with word-based edge deduplication.
+/// Finds the longest suffix of segment N's words matching a prefix of segment N+1's words,
+/// and skips the overlapping prefix to avoid repeated phrases at segment boundaries.
+fn merge_segments_edge_dedup(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::new();
+    }
+    let mut result_words: Vec<String> = segments[0].split_whitespace().map(String::from).collect();
+    for seg in &segments[1..] {
+        let new_words: Vec<&str> = seg.split_whitespace().collect();
+        if new_words.is_empty() {
+            continue;
+        }
+        // Find longest suffix of result_words matching prefix of new_words
+        let max_overlap = result_words.len().min(new_words.len());
+        let mut overlap = 0;
+        for len in (1..=max_overlap).rev() {
+            let suffix = &result_words[result_words.len() - len..];
+            let prefix = &new_words[..len];
+            if suffix.iter().zip(prefix).all(|(a, b)| a == b) {
+                overlap = len;
+                break;
+            }
+        }
+        for w in &new_words[overlap..] {
+            result_words.push((*w).to_owned());
+        }
+    }
+    result_words.join(" ")
 }
 
 fn num_cpus() -> usize {

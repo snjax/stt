@@ -106,14 +106,9 @@ async fn run_session(
         .send(Ok(()))
         .map_err(|_| anyhow::anyhow!("setup receiver dropped"))?;
 
-    loop {
-        match cmd_rx.recv() {
-            Ok(PasteCommand::CtrlV) => {
-                let r = send_ctrl_v(&proxy, &session).await;
-                let _ = result_tx.send(r.map_err(|e| e.to_string()));
-            }
-            Ok(PasteCommand::Shutdown) | Err(_) => break,
-        }
+    while let Ok(PasteCommand::CtrlV) = cmd_rx.recv() {
+        let r = send_ctrl_v(&proxy, &session).await;
+        let _ = result_tx.send(r.map_err(|e| e.to_string()));
     }
 
     Ok(())
