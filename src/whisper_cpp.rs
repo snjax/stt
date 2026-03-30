@@ -182,6 +182,8 @@ unsafe extern "C" {
     ) -> i32;
     fn whisper_full_n_segments(ctx: *mut whisper_context) -> i32;
     fn whisper_full_get_segment_text(ctx: *mut whisper_context, i_segment: i32) -> *const i8;
+    fn whisper_full_get_segment_t0(ctx: *mut whisper_context, i_segment: i32) -> i64;
+    fn whisper_full_get_segment_t1(ctx: *mut whisper_context, i_segment: i32) -> i64;
 
     fn whisper_pcm_to_mel(
         ctx: *mut whisper_context,
@@ -200,6 +202,15 @@ unsafe extern "C" {
 }
 
 // --- Safe Rust wrapper ---
+
+/// A transcribed segment with start/end timestamps in milliseconds.
+pub struct TimedSegment {
+    /// Start time in milliseconds (relative to audio start)
+    pub t0_ms: i64,
+    /// End time in milliseconds
+    pub t1_ms: i64,
+    pub text: String,
+}
 
 pub struct WhisperCppTranscriber {
     ctx: *mut whisper_context,
@@ -289,6 +300,77 @@ impl WhisperCppTranscriber {
         let result = merge_segments_edge_dedup(&segments);
         eprintln!("[transcribe] result: {} chars", result.len());
         Ok(result)
+    }
+
+    /// Transcribe samples and return timed segments (for chunk-based streaming).
+    pub fn transcribe_samples_timed(&self, samples: &[f32]) -> Result<Vec<TimedSegment>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params = unsafe {
+            whisper_full_default_params(whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY)
+        };
+
+        let lang = CString::new("auto").unwrap();
+        params.language = lang.as_ptr();
+        params.no_context = true;
+        params.single_segment = false;
+        params.print_special = false;
+        params.print_progress = false;
+        params.print_realtime = false;
+        params.print_timestamps = false;
+        params.suppress_blank = true;
+        params.suppress_nst = true;
+        params.no_speech_thold = 0.6;
+        params.entropy_thold = 2.4;
+        params.n_threads = num_cpus().min(8) as i32;
+
+        let detected = self.detect_language(samples)?;
+        let forced_lang = if detected == "ru" { "ru" } else { "en" };
+        let forced = CString::new(forced_lang).unwrap();
+        params.language = forced.as_ptr();
+        params.detect_language = false;
+
+        let ret = unsafe {
+            whisper_full(self.ctx, params, samples.as_ptr(), samples.len() as i32)
+        };
+
+        if ret != 0 {
+            bail!("whisper_full failed with code {ret}");
+        }
+
+        let n_segments = unsafe { whisper_full_n_segments(self.ctx) };
+        eprintln!(
+            "[transcribe_timed] samples={} ({:.1}s), segments={}",
+            samples.len(),
+            samples.len() as f64 / 16000.0,
+            n_segments
+        );
+
+        let mut segments = Vec::new();
+        for i in 0..n_segments {
+            let (t0, t1, text) = unsafe {
+                let t0 = whisper_full_get_segment_t0(self.ctx, i) * 10; // centiseconds → ms
+                let t1 = whisper_full_get_segment_t1(self.ctx, i) * 10;
+                let ptr = whisper_full_get_segment_text(self.ctx, i);
+                if ptr.is_null() {
+                    continue;
+                }
+                let text = CStr::from_ptr(ptr).to_str().unwrap_or("");
+                (t0, t1, text)
+            };
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                segments.push(TimedSegment {
+                    t0_ms: t0,
+                    t1_ms: t1,
+                    text: trimmed.to_owned(),
+                });
+            }
+        }
+
+        Ok(segments)
     }
 
     #[allow(dead_code)]
